@@ -58,6 +58,120 @@ const WHEELCACHE_MOUNT_PATH: &str = "/wheelcache";
 /// Secret or a user-provided `extraConfigSecretRef`.
 pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 
+/// Package distribution names (wheel-filename form: non-alphanumeric runs
+/// become `_`, matched case-insensitively since wheel filenames preserve
+/// original casing like `SQLAlchemy`/`WebOb`) assumed already present in
+/// any real `neutron-server` image, and therefore excluded from
+/// installation into the isolated plugin directory even when a driver's
+/// resolved dependency closure includes them. See `apply_injection_patch`'s
+/// doc comment for the full rationale and how this list was derived --
+/// this is the actual set observed from a real `pip download
+/// unifi-ml2-driver` run, not a guess, and it's ecosystem-level (standard
+/// OpenStack/Neutron tooling), not specific to that one driver: any
+/// Neutron ML2 driver plugin is likely to declare a similar set, since
+/// they're all guaranteed to already be present by definition of running
+/// inside `neutron-server`'s own process.
+const ASSUMED_PRESENT_PACKAGES: &[&str] = &[
+    // Neutron itself and its immediate OVN/OVS/networking-service stack.
+    "neutron",
+    "neutron_lib",
+    "os_vif",
+    "os_resource_classes",
+    "os_service_types",
+    "os_traits",
+    "os_ken",
+    "ovs",
+    "ovsdbapp",
+    // OpenStack client/auth libraries any Neutron deployment integrating
+    // with Keystone/Nova/Designate (as this one does) already has.
+    "keystoneauth1",
+    "keystonemiddleware",
+    "python_keystoneclient",
+    "python_novaclient",
+    "python_designateclient",
+    "openstacksdk",
+    "osc_lib",
+    "cliff",
+    // Every oslo.* subpackage -- a regex fragment, not an exhaustive
+    // enumeration, since new ones shouldn't need a code change here.
+    // `[a-z0-9_]+`, not just letters: `oslo.i18n` -> `oslo_i18n` has a
+    // digit, and slipped through an earlier letters-only version of this
+    // pattern during validation against a real dependency download.
+    "oslo_[a-z0-9_]+",
+    // Common OpenStack-ecosystem support libraries.
+    "osprofiler",
+    "pycadf",
+    "debtcollector",
+    "futurist",
+    "fasteners",
+    "cotyledon",
+    "dogpile_cache",
+    "stevedore",
+    "eventlet",
+    "greenlet",
+    "alembic",
+    "sqlalchemy",
+    "webob",
+    "paste",
+    "pastedeploy",
+    "pbr",
+    "mako",
+    "prettytable",
+    "prometheus_client",
+    "psutil",
+    // WSGI framework used by parts of the OpenStack API ecosystem --
+    // showed up in the real dependency resolve validated below via
+    // neutron's own transitive requirements, not anything UniFi-specific.
+    "pecan",
+    "pyjwt",
+    "pynacl",
+    "pyopenssl",
+    "python_dateutil",
+    "pyyaml",
+    "requests",
+    "urllib3",
+    "certifi",
+    "rfc3986",
+    "jsonschema",
+    "jsonschema_specifications",
+    "prompt_toolkit",
+    "cmd2",
+    "autopage",
+    "six",
+    "decorator",
+    "iso8601",
+    "netaddr",
+    "jmespath",
+    "jsonpatch",
+    "jsonpointer",
+    "msgpack",
+    "amqp",
+    "kombu",
+    "vine",
+    "cachetools",
+    "orjson",
+    "lxml",
+    "httplib2",
+    "pyparsing",
+    "jinja2",
+    "markupsafe",
+    "packaging",
+    "platformdirs",
+    "cffi",
+    "cryptography",
+    "bcrypt",
+    "idna",
+    "wrapt",
+    "sortedcontainers",
+    "tenacity",
+    "tzdata",
+    "typing_extensions",
+    "wcwidth",
+    "voluptuous",
+    "setuptools",
+    "dnspython",
+];
+
 pub struct K8s {
     client: Client,
     namespace: String,
@@ -233,20 +347,50 @@ impl K8s {
                 ))
             })?;
 
-        let install_targets: Vec<String> = drivers.iter().map(|d| d.pip_package.clone()).collect();
-        let find_links: Vec<String> = drivers
-            .iter()
-            .map(|d| format!("{WHEELCACHE_MOUNT_PATH}/{}", d.name))
-            .collect();
-
+        // NOT a plain `pip install --find-links=... <package>` -- that lets
+        // pip resolve and install the driver's *entire* dependency closure,
+        // which for any real Neutron ML2 driver includes `neutron`/
+        // `neutron-lib` themselves (they're declared dependencies, since
+        // that's how Python packaging expresses "this needs Neutron's
+        // API," even though the package is guaranteed to be running inside
+        // neutron-server's own process already). With PYTHONPATH
+        // prepending this directory ahead of the image's real
+        // site-packages, that silently shadows the image's actual,
+        // Platform9-patched, OVN-customized `neutron` package with a
+        // generic upstream copy -- confirmed live: this is exactly what
+        // crashed `neutron-server` on 2026-09-14 with `ModuleNotFoundError:
+        // No module named 'neutron.cmd.eventlet'` (see the design doc's
+        // incident writeup).
+        //
+        // Fix: walk every driver's cached wheels, exclude ones matching
+        // `ASSUMED_PRESENT_PACKAGES` below, and install only what's left,
+        // each with `--no-deps` so pip doesn't try to re-resolve (and
+        // re-pull-in) an excluded one transitively. A shell filter rather
+        // than something computed in Rust and threaded through as an
+        // explicit file list, so it stays driver-agnostic -- no
+        // per-driver knowledge needed here beyond where its wheels are
+        // cached.
+        //
+        // The exclusion list itself needed to be much broader than a first
+        // guess: a real `pip download unifi-ml2-driver` (run locally,
+        // 2026-09-14, to check this fix before another live attempt)
+        // resolved ~150 packages, the large majority of them standard
+        // OpenStack/Neutron-ecosystem tooling (keystoneauth1,
+        // python-novaclient, SQLAlchemy, every oslo.* subpackage, etc.) --
+        // exactly the class of thing any real Neutron+OVN+Designate
+        // deployment already has, not just `neutron`/`neutron-lib`
+        // narrowly. This list is that real, observed set, not a guess --
+        // still an assumption that PCD's specific image has all of them
+        // (reasonable for a working OpenStack Neutron service, but not
+        // independently verified item-by-item), so treat a repair that
+        // still crashes on a *different* shadowed package as "the list
+        // needs one more entry," not "the approach is wrong."
         let install_cmd = format!(
-            "pip install --no-index {} --target={PLUGIN_MOUNT_PATH} {}",
-            find_links
-                .iter()
-                .map(|p| format!("--find-links={p}"))
-                .collect::<Vec<_>>()
-                .join(" "),
-            install_targets.join(" "),
+            "mkdir -p {PLUGIN_MOUNT_PATH} && \
+             find {WHEELCACHE_MOUNT_PATH} -mindepth 2 -maxdepth 2 -name '*.whl' \
+             | grep -Eiv '/({})-[0-9]' \
+             | xargs -r pip install --no-index --no-deps --target={PLUGIN_MOUNT_PATH}",
+            ASSUMED_PRESENT_PACKAGES.join("|"),
         );
 
         // Unconditionally bumped on every call: Kubernetes only starts a new
@@ -353,6 +497,81 @@ impl K8s {
                 deployment_name,
                 &PatchParams::apply("neutron-ml2-guardian").force(),
                 &Patch::Apply(patch),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reverts everything `apply_injection_patch` may have added, for the
+    /// given drivers. Used when `Config::dry_run` finds a guardian
+    /// footprint already present -- see `reconcile::revert_or_preview`.
+    ///
+    /// Deliberately uses an explicit `Patch::Strategic` with `$patch:
+    /// delete` entries, **not** a `Patch::Apply` that simply omits the
+    /// fields we no longer want. SSA's "omitting a field you own removes
+    /// it" behavior is plausible but was never actually verified against
+    /// this cluster, and this project has already been burned once by an
+    /// unverified assumption about Kubernetes patch behavior (see the
+    /// design doc's incident writeup). `$patch: delete` is the exact,
+    /// explicit mechanism already confirmed working, by hand, during that
+    /// incident's real recovery -- reusing proven behavior here rather than
+    /// a new untested code path. `PatchParams::default()` (no field
+    /// manager/force) is correct for strategic merge patches -- those are
+    /// only meaningful for `Patch::Apply`.
+    ///
+    /// NOTE: `volumeMounts`' strategic-merge-patch key is `mountPath`, not
+    /// `name` -- confirmed the hard way during that same incident, unlike
+    /// `volumes`/`containers`/`initContainers`, which all use `name`.
+    /// Idempotent: deleting an already-absent list item is a no-op.
+    pub async fn remove_injection_patch(
+        &self,
+        deployment_name: &str,
+        main_container_name: &str,
+        drivers: &[DriverSpec],
+    ) -> GuardianResult<()> {
+        let mut volume_deletes = vec![
+            json!({ "name": PLUGIN_VOLUME_NAME, "$patch": "delete" }),
+            json!({ "name": WHEELCACHE_VOLUME_NAME, "$patch": "delete" }),
+        ];
+        let mut mount_deletes = vec![json!({ "mountPath": PLUGIN_MOUNT_PATH, "$patch": "delete" })];
+        for driver in drivers {
+            volume_deletes.push(json!({
+                "name": format!("ml2-extra-config-{}", driver.name),
+                "$patch": "delete",
+            }));
+            mount_deletes.push(json!({
+                "mountPath": format!("{EXTRA_CONF_DIR}/{}.conf", driver.name),
+                "$patch": "delete",
+            }));
+        }
+
+        let patch = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "initContainers": [
+                            { "name": INJECTOR_CONTAINER_NAME, "$patch": "delete" }
+                        ],
+                        "volumes": volume_deletes,
+                        "containers": [
+                            {
+                                "name": main_container_name,
+                                "env": [
+                                    { "name": "PYTHONPATH", "$patch": "delete" }
+                                ],
+                                "volumeMounts": mount_deletes,
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+
+        self.deployments()
+            .patch(
+                deployment_name,
+                &PatchParams::default(),
+                &Patch::Strategic(patch),
             )
             .await?;
         Ok(())

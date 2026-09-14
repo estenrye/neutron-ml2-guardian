@@ -81,6 +81,18 @@ pub async fn run_once(
 ) -> GuardianResult<()> {
     let deployment = k8s.get_deployment(&cfg.deployment_name).await?;
 
+    // DRY_RUN=true means "the guardian's real-world footprint should be
+    // zero" -- handled entirely up front, separately from the repair loop
+    // below. See `revert_or_preview`'s doc comment for the two cases this
+    // covers (nothing to revert yet vs. active revert), added 2026-09-14
+    // directly in response to a real incident: this gives an operator who
+    // just set DRY_RUN=false and hit trouble an actual undo button,
+    // instead of needing to hand-craft the same kubectl patches under
+    // pressure that this project's own incident recovery needed.
+    if cfg.dry_run {
+        return revert_or_preview(cfg, k8s, &deployment).await;
+    }
+
     for driver in &cfg.drivers {
         let backing_off = state
             .consecutive_failures
@@ -108,23 +120,6 @@ pub async fn run_once(
                 // reasons unrelated to installation.
                 tracing::error!(driver = %driver.name, reason, "driver present but degraded, not attempting repair");
                 metrics::record_present(&driver.name, false);
-            }
-            CheckResult::Absent if cfg.dry_run => {
-                metrics::record_present(&driver.name, false);
-                // Intentionally does not call repair() at all -- no
-                // helm upgrade, no Deployment patch, no Job creation. See
-                // Config::dry_run's doc comment and the design doc's
-                // "Status" section: this is the safe default until an
-                // operator deliberately sets DRY_RUN=false.
-                match describe_intended_repair(cfg, k8s, driver).await {
-                    Ok(description) => {
-                        tracing::warn!(driver = %driver.name, %description, "DRY RUN: driver absent, repair skipped (would apply the above)");
-                    }
-                    Err(e) => {
-                        tracing::warn!(driver = %driver.name, error = %e, "DRY RUN: driver absent, and computing the intended repair also failed (this read-only failure would likely also fail a real repair)");
-                    }
-                }
-                metrics::record_repair_dry_run(&driver.name);
             }
             CheckResult::Absent => {
                 metrics::record_present(&driver.name, false);
@@ -347,11 +342,168 @@ fn add_config_dir_flag(script: &str) -> GuardianResult<String> {
     Ok(result)
 }
 
+/// Inverse of `add_driver_to_ml2_conf`: removes `driver_name` from the
+/// `mechanism_drivers` line if present, leaving every other line
+/// byte-for-byte untouched. Infallible and idempotent -- returns the input
+/// unchanged if the driver isn't listed, or if there's no
+/// `mechanism_drivers` line at all (nothing to revert either way, unlike
+/// `add_driver_to_ml2_conf` this never needs to guess where to insert
+/// anything).
+fn remove_driver_from_ml2_conf(ml2_conf: &str, driver_name: &str) -> String {
+    let mut out_lines = Vec::new();
+    for line in ml2_conf.lines() {
+        if line.trim_start().starts_with("mechanism_drivers") {
+            let current = line.split('=').nth(1).unwrap_or("");
+            let drivers: Vec<&str> = current
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && *s != driver_name)
+                .collect();
+            out_lines.push(format!("mechanism_drivers = {}", drivers.join(",")));
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    let mut result = out_lines.join("\n");
+    if ml2_conf.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Inverse of `add_config_dir_flag`: removes the `--config-dir
+/// EXTRA_CONF_DIR` line and restores the preceding (anchor) line to its
+/// original form by stripping the trailing `" \\"` continuation
+/// `add_config_dir_flag` gave it. Infallible and idempotent -- a no-op if
+/// the flag isn't present.
+fn remove_config_dir_flag(script: &str) -> String {
+    let marker = format!("        --config-dir {EXTRA_CONF_DIR}");
+    if !script.contains(&marker) {
+        return script.to_string();
+    }
+
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in script.lines() {
+        if line == marker {
+            if let Some(last) = out_lines.last_mut() {
+                if let Some(stripped) = last.strip_suffix(" \\") {
+                    *last = stripped.to_string();
+                }
+            }
+            continue;
+        }
+        out_lines.push(line.to_string());
+    }
+
+    let mut result = out_lines.join("\n");
+    if script.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
 /// Computes (read-only -- one Secret `get` call, no mutation) a
 /// human-readable description of what `repair` would do, for `DRY_RUN`
 /// mode. Deliberately mirrors `repair`'s own logic for the mechanism_drivers
 /// merge so the dry-run log line reflects the real computed value, not a
 /// guess.
+/// Handles the entire `DRY_RUN=true` path. Two distinct cases, both
+/// idempotent and safe to run every reconcile tick:
+///
+/// - **No guardian footprint detected** (nothing in `mechanism_drivers`
+///   matches a configured driver, and the injection isn't present): this
+///   is "never installed yet" -- preserve the original preview-only safety
+///   behavior (`describe_intended_repair`, no mutation at all), so an
+///   operator activating a driver for the first time can still see exactly
+///   what a real repair would do before ever setting `DRY_RUN=false`.
+/// - **A footprint is detected**: this is "was installed, DRY_RUN was
+///   switched back on" -- actively revert it (added 2026-09-14, directly
+///   in response to a real incident where this had to be done by hand).
+///   Reverts unconditionally for every configured driver, regardless of
+///   its individual footprint, since a partial/broken injection (like the
+///   incident's crash-looping state, which reads as `Degraded` rather than
+///   `Present` in the layered check) still needs cleaning up -- this
+///   deliberately does not reuse `check_present`'s Present/Degraded/Absent
+///   distinction, which answers "is it working," a different question
+///   from "did the guardian leave anything behind."
+async fn revert_or_preview(
+    cfg: &Config,
+    k8s: &K8s,
+    deployment: &k8s_openapi::api::apps::v1::Deployment,
+) -> GuardianResult<()> {
+    let has_injection = K8s::has_injection(deployment);
+    let current_ml2_conf = k8s
+        .get_secret_key(NEUTRON_ETC_SECRET_NAME, ML2_CONF_SECRET_KEY)
+        .await?;
+
+    let any_footprint = has_injection
+        || cfg
+            .drivers
+            .iter()
+            .any(|d| mechanism_drivers_line_includes(&current_ml2_conf, &d.name));
+
+    if !any_footprint {
+        for driver in &cfg.drivers {
+            metrics::record_present(&driver.name, false);
+            match describe_intended_repair(cfg, k8s, driver).await {
+                Ok(description) => {
+                    tracing::warn!(driver = %driver.name, %description, "DRY RUN: driver absent, repair skipped (would apply the above)");
+                }
+                Err(e) => {
+                    tracing::warn!(driver = %driver.name, error = %e, "DRY RUN: driver absent, and computing the intended repair also failed (this read-only failure would likely also fail a real repair)");
+                }
+            }
+            metrics::record_repair_dry_run(&driver.name);
+        }
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "DRY_RUN=true and a guardian footprint was found on {} -- reverting to the pre-guardian state",
+        cfg.deployment_name
+    );
+
+    let mut new_ml2_conf = current_ml2_conf.clone();
+    for driver in &cfg.drivers {
+        new_ml2_conf = remove_driver_from_ml2_conf(&new_ml2_conf, &driver.name);
+    }
+    if new_ml2_conf != current_ml2_conf {
+        k8s.patch_secret_key(NEUTRON_ETC_SECRET_NAME, ML2_CONF_SECRET_KEY, &new_ml2_conf)
+            .await?;
+        tracing::warn!("REVERT: removed guardian-managed driver(s) from mechanism_drivers");
+    }
+
+    let current_script = k8s
+        .get_configmap_key(NEUTRON_BIN_CONFIGMAP_NAME, NEUTRON_SERVER_SCRIPT_KEY)
+        .await?;
+    let new_script = remove_config_dir_flag(&current_script);
+    if new_script != current_script {
+        k8s.patch_configmap_key(
+            NEUTRON_BIN_CONFIGMAP_NAME,
+            NEUTRON_SERVER_SCRIPT_KEY,
+            &new_script,
+        )
+        .await?;
+        tracing::warn!("REVERT: removed --config-dir flag from neutron-server.sh");
+    }
+
+    if has_injection {
+        k8s.remove_injection_patch(&cfg.deployment_name, MAIN_CONTAINER_NAME, &cfg.drivers)
+            .await?;
+        tracing::warn!(
+            "REVERT: removed injected initContainer/volumes/env from deployment {}",
+            cfg.deployment_name
+        );
+    }
+
+    for driver in &cfg.drivers {
+        metrics::record_present(&driver.name, false);
+        metrics::record_revert(&driver.name);
+    }
+
+    Ok(())
+}
+
 async fn describe_intended_repair(
     cfg: &Config,
     k8s: &K8s,
@@ -556,5 +708,47 @@ function start () {
     fn add_config_dir_flag_errors_without_anchor_line() {
         let result = add_config_dir_flag("#!/bin/bash\nexec neutron-server\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn remove_driver_from_ml2_conf_removes_when_present() {
+        let with_unifi = add_driver_to_ml2_conf(SAMPLE_ML2_CONF, "unifi").unwrap();
+        let reverted = remove_driver_from_ml2_conf(&with_unifi, "unifi");
+        assert!(!mechanism_drivers_line_includes(&reverted, "unifi"));
+        // Original drivers untouched.
+        assert!(mechanism_drivers_line_includes(&reverted, "ovn"));
+        assert!(mechanism_drivers_line_includes(&reverted, "openvswitch"));
+    }
+
+    #[test]
+    fn remove_driver_from_ml2_conf_round_trips_to_original() {
+        let with_unifi = add_driver_to_ml2_conf(SAMPLE_ML2_CONF, "unifi").unwrap();
+        let reverted = remove_driver_from_ml2_conf(&with_unifi, "unifi");
+        assert_eq!(reverted, SAMPLE_ML2_CONF);
+    }
+
+    #[test]
+    fn remove_driver_from_ml2_conf_is_idempotent_when_absent() {
+        let unchanged = remove_driver_from_ml2_conf(SAMPLE_ML2_CONF, "unifi");
+        assert_eq!(unchanged, SAMPLE_ML2_CONF);
+    }
+
+    #[test]
+    fn remove_driver_from_ml2_conf_noop_without_mechanism_drivers_line() {
+        let conf = "[ml2]\ntype_drivers = vlan\n";
+        assert_eq!(remove_driver_from_ml2_conf(conf, "unifi"), conf);
+    }
+
+    #[test]
+    fn remove_config_dir_flag_round_trips_to_original() {
+        let with_flag = add_config_dir_flag(SAMPLE_NEUTRON_SERVER_SH).unwrap();
+        let reverted = remove_config_dir_flag(&with_flag);
+        assert_eq!(reverted, SAMPLE_NEUTRON_SERVER_SH);
+    }
+
+    #[test]
+    fn remove_config_dir_flag_is_idempotent_when_absent() {
+        let unchanged = remove_config_dir_flag(SAMPLE_NEUTRON_SERVER_SH);
+        assert_eq!(unchanged, SAMPLE_NEUTRON_SERVER_SH);
     }
 }

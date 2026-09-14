@@ -518,29 +518,112 @@ real bug before finding the serious one:
   and being *wrong in its own content*, which is what actually happened
   here. That's a different, harder problem this design doesn't yet solve.
 
-**Before any future `DRY_RUN=false` attempt, this needs an actual fix, not
-just a retry** -- likely one of:
-- Only `pip install --no-deps` the target driver package itself, and
-  separately resolve/install just its *genuinely new* dependencies
-  (e.g. for `unifi-ml2-driver`: `aiohttp-unifi`, `netmiko`, `etcd3gw`,
-  `tooz`, `tenacity`) while explicitly excluding the ones any real
-  `neutron-server` environment already has by definition of running
-  inside it (`neutron`, `neutron-lib`, `oslo-*`, `stevedore`, likely
-  `eventlet`) -- an ecosystem-level exclusion list, not a driver-specific
-  one, since *every* Neutron ML2 driver package will declare `neutron`/
-  `neutron-lib` as dependencies for exactly this reason.
-- Or: install into an isolated location and use a mechanism that only
-  falls back to it for imports the base environment can't already satisfy
-  (checked-last, not checked-first) -- `PYTHONPATH`'s prepend-only
-  semantics can't express this directly; would need the `.pth`-file
-  fallback approach mentioned earlier in this doc, adapted for
-  ordering rather than just as an alternative injection point, or a
-  custom `sitecustomize.py`/import-hook approach.
-- Either way: **test the exact resolved dependency list against the real
-  image's existing site-packages before the next live attempt** -- this
-  failure mode is now fully predictable in advance, not something that
-  requires another live-fire test to rediscover.
+**Fixed 2026-09-14, validated offline against the real dependency tree
+before trusting it again.** Went with the exclusion-list approach (the
+first candidate fix above), not the checked-last-import-order approach --
+simpler, and directly testable without another live cluster round-trip.
 
-Still true from the second attempt, now blocked behind the above: confirm
-the post-repair present-check and `neutron-server`'s stability once a real
-repair can be attempted safely again.
+The initContainer's install step no longer runs a plain `pip install
+--find-links=... <package>` (which lets pip resolve and install the
+driver's entire dependency closure unconditionally). It now walks every
+driver's cached wheels, filters out filenames matching
+`k8s::ASSUMED_PRESENT_PACKAGES` (a maintained list, not a one-off guess),
+and installs only what's left, each with `--no-deps` so pip can't
+transitively re-pull an excluded package back in.
+
+That exclusion list needed to be **far broader than the first guess**
+(`neutron`, `neutron-lib`, `oslo-*`, `stevedore`, `eventlet`). Validated by
+actually running `pip download unifi-ml2-driver` locally (not against the
+cluster) on 2026-09-14: it resolves **144 packages**, the large majority
+of them standard OpenStack/Neutron-ecosystem tooling --
+`keystoneauth1`, `python-novaclient`, `python-designateclient`,
+`openstacksdk`, `SQLAlchemy`, `alembic`, `WebOb`, every `oslo.*`
+subpackage, etc. -- exactly the class of thing a real Neutron+OVN+Designate
+deployment already has, not just the two packages named in the original
+crash. The final list (~85 entries, see `k8s.rs`) was built from this real
+output, not a guess, and validated by applying the exact generated
+`grep -Eiv` pattern against the real 144 filenames: it correctly excludes
+all the OpenStack-ecosystem ones and leaves 41 genuinely new packages
+(`unifi-ml2-driver` itself, its `aiohttp`/`aiohttp-unifi` stack,
+coordination libraries `etcd3gw`/`tooz`, network-automation tooling
+`netmiko`/`ncclient`/`paramiko`/`scp`/`textfsm`, and a tail of small
+CLI/testing/utility libraries) -- none of them core OpenStack packages
+that could plausibly already exist in the base image and get shadowed.
+
+Two real mistakes this validation pass caught before they could cause a
+*third* incident:
+- The `oslo_[a-z_]+` regex fragment doesn't match `oslo_i18n` --
+  `oslo.i18n`'s normalized wheel-filename form has a digit in it (`i18n`),
+  which `[a-z_]+` (letters and underscores only) doesn't cover. Fixed to
+  `oslo_[a-z0-9_]+`.
+- `pecan` (a WSGI framework pulled in transitively by the same resolve,
+  OpenStack-ecosystem-adjacent rather than UniFi-specific) wasn't on the
+  list at all. Added.
+
+**Still true, and still the honest caveat**: this list is now
+evidence-based rather than guessed, but it's still an assumption that
+PCD's specific `pf9-neutron` image has every one of these ~85 packages
+already -- not independently verified item-by-item against that image's
+actual site-packages. A future repair that crashes on a *different*
+shadowed package should be read as "the list needs one more entry," not
+"the approach doesn't work." The next live `DRY_RUN=false` attempt is the
+first real test of both fixes together (this one, and the automated
+revert logic below) -- worth doing deliberately, not assumed safe just
+because the offline validation looked clean.
+
+Still true from the second attempt: confirm the post-repair present-check
+and `neutron-server`'s stability once a real repair can be attempted
+safely again.
+
+## Automated revert: `DRY_RUN=true` now means "zero footprint," not just "don't touch anything"
+
+Added 2026-09-14, directly in response to the incident above: switching
+`DRY_RUN` back to `true` after a bad `DRY_RUN=false` attempt used to do
+nothing but stop future repairs -- whatever damage was already done stayed
+in place, requiring exactly the by-hand `kubectl patch` recovery this
+project's own incident needed. Now `revert_or_preview` (in `reconcile.rs`)
+handles the entire `DRY_RUN=true` path, and covers two distinct cases:
+
+- **No guardian footprint found** (nothing in `mechanism_drivers` matches a
+  configured driver, and the injection isn't present): unchanged from the
+  original design -- log what a real repair *would* do
+  (`describe_intended_repair`), mutate nothing. This preserves the
+  original safety value of previewing a driver's first-ever activation
+  before ever setting `DRY_RUN=false`.
+- **A footprint is found**: actively revert it. Removes each configured
+  driver from `mechanism_drivers`, removes the `--config-dir` flag from
+  `neutron-server.sh`, and removes the entire injected
+  initContainer/volumes/env/mounts from the Deployment
+  (`k8s::remove_injection_patch`) -- unconditionally for every configured
+  driver, regardless of whether `check_present` would call its individual
+  state `Present` or `Degraded`. That distinction deliberately isn't
+  reused here: it answers "is the driver working," a different question
+  from "did the guardian leave something behind," and the actual incident
+  state (crash-looping, no Ready pod) reads as `Degraded`, not `Present` --
+  a naive "only revert what's `Present`" design would have missed exactly
+  the case that motivated this feature.
+
+`remove_injection_patch` deliberately uses an explicit `Patch::Strategic`
+with `$patch: delete` entries -- not a `Patch::Apply` that simply omits
+fields it no longer wants (which SSA's "omission removes what you own"
+semantics would plausibly also achieve, but that was never actually
+verified against this cluster, and this project already got burned once by
+an unverified assumption about Kubernetes patch behavior in the same
+incident). `$patch: delete` is the exact mechanism already confirmed
+working, by hand, during that incident's real recovery -- this reuses
+proven behavior rather than a new untested code path. One real detail this
+surfaced: `volumeMounts`' strategic-merge-patch key is `mountPath`, not
+`name`, unlike `volumes`/`containers`/`initContainers` (all `name`) --
+discovered the hard way during the incident's manual recovery, now baked
+into the automated version too.
+
+New pure functions (`remove_driver_from_ml2_conf`,
+`remove_config_dir_flag`), both infallible and idempotent, with
+round-trip tests (`remove_X(add_X(input)) == input`) against the
+corresponding `add_X` functions.
+
+**Not yet live-tested**: the revert path compiles, passes its unit tests,
+and its underlying mechanism ($patch: delete) is proven from the manual
+incident recovery, but the automated version (triggered by the guardian
+itself, not a human running kubectl) hasn't been exercised end-to-end
+against a real injected footprint yet.

@@ -168,6 +168,23 @@ pub fn record_repair_dry_run(driver: &str) {
         .inc();
 }
 
+/// `DRY_RUN=true` found and reverted an existing guardian footprint (see
+/// `reconcile::revert_or_preview`, added 2026-09-14 after a real incident).
+/// Reuses `repairs_total` with a distinct outcome label rather than a new
+/// instrument, consistent with `applied`/`skipped`/`dry_run` above.
+pub fn record_revert(driver: &str) {
+    INSTRUMENTS.repairs_total.add(
+        1,
+        &[
+            KeyValue::new("driver", driver.to_string()),
+            KeyValue::new("outcome", "reverted"),
+        ],
+    );
+    PROM.repairs_total
+        .with_label_values(&[driver, "reverted"])
+        .inc();
+}
+
 pub fn record_repair_failure(driver: &str) {
     INSTRUMENTS
         .repair_failures_total

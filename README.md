@@ -94,14 +94,27 @@ This installs:
   `wheelcache.storageClassName` to a real RWX class (NFS-backed, etc.) if
   yours is one.
 
-By default (`dryRun: true`) it will not actually touch the target release --
-it logs exactly what a repair would do (the computed `mechanism_drivers`
-value, the intended Deployment patch, the wheel-cache refresh) without
-patching anything or creating a Job. Watch a few reconcile cycles' logs,
-confirm they look right, then deliberately set `dryRun: false` (`--set
-dryRun=false` or in your values file) to let it actually repair. This
-default exists specifically because the RBAC grant above is real power and
-shouldn't run unattended before you've seen what it intends to do.
+`dryRun: true` (the default) means **the guardian's real-world footprint
+should be zero** -- which is two different behaviors depending on current
+state, not just "do nothing":
+- If nothing's been installed yet, it only logs what a repair would do
+  (the computed `mechanism_drivers` value, the intended Deployment patch,
+  the wheel-cache refresh) without mutating anything. Watch a few
+  reconcile cycles' logs, confirm they look right, then deliberately set
+  `dryRun: false` to let it actually repair.
+- If something *was* installed (e.g. you'd previously set `dryRun: false`
+  and want to undo it), it actively reverts -- removing the driver from
+  `mechanism_drivers`, removing the injected initContainer/volumes/env
+  from `neutron-server`, and removing the `--config-dir` flag it added.
+  This is a real, deliberate safety feature (added after an actual
+  incident during development -- see the design doc), not a side effect:
+  flipping back to `dryRun: true` is meant to be usable as an undo button
+  if a repair goes wrong, without needing to hand-craft `kubectl` patches
+  under pressure.
+
+This default exists specifically because the RBAC grant above is real
+power and shouldn't run unattended before you've seen what it intends to
+do -- in either direction.
 
 ## Status
 
