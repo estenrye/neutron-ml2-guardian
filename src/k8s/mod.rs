@@ -58,17 +58,21 @@ const WHEELCACHE_MOUNT_PATH: &str = "/wheelcache";
 /// Secret or a user-provided `extraConfigSecretRef`.
 pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 
-/// Back-ports `typing.Self` (PEP 673) and `typing.NotRequired`/`Required`
-/// (PEP 655) -- all Python 3.11+ additions -- onto the real `typing` module
-/// when running under an older interpreter, from the `typing_extensions`
-/// backport already assumed present in the target image (see
-/// `ASSUMED_PRESENT_PACKAGES`). Not just `Self`: a real repair crashed a
-/// second time on `NotRequired` alone, from an import statement that named
-/// both symbols together (`from typing import NotRequired, Self,
-/// TypedDict`) -- a single unconditional import fails whole if *any* named
-/// attribute is missing, so both had to be covered, and `Required` is the
-/// same PEP's other half. Written into `PLUGIN_MOUNT_PATH` as
-/// `sitecustomize.py`, which Python's `site` module auto-imports at
+/// Back-ports Python 3.11+ stdlib additions onto an older interpreter:
+/// `typing.Self` (PEP 673), `typing.NotRequired`/`Required` (PEP 655) from
+/// the `typing_extensions` backport, and `enum.StrEnum` from the
+/// `backports.strenum` backport -- both already assumed present in the
+/// target image (see `ASSUMED_PRESENT_PACKAGES`). All three found the same
+/// way: a real repair against `unifi-ml2-driver`'s `aiohttp-unifi`
+/// dependency crashed three times in a row, once per missing symbol,
+/// because most of that package's modules guard these imports with a
+/// `try`/`except ImportError` fallback but four specific files don't --
+/// confirmed by statically scanning every module in every cached wheel for
+/// unconditional imports of any Python 3.11+-only name, rather than
+/// continuing to fix these one crash at a time. `Required` isn't actually
+/// referenced unguarded anywhere found, but is PEP 655's other half and
+/// cheap to cover alongside `NotRequired`. Written into `PLUGIN_MOUNT_PATH`
+/// as `sitecustomize.py`, which Python's `site` module auto-imports at
 /// interpreter startup for anything importable on `sys.path` -- PYTHONPATH
 /// included -- so this runs before neutron-server loads any mechanism
 /// driver. A single-line string with explicit `\n`s, deliberately not
@@ -77,7 +81,7 @@ pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 /// which silently ate this script's indentation the first time and produced
 /// an `IndentationError` -- confirmed live, see the design doc's incident
 /// writeup.
-const SITECUSTOMIZE_PY: &str = "import sys\nif sys.version_info < (3, 11):\n    import typing\n    import typing_extensions\n    for _name in (\"Self\", \"NotRequired\", \"Required\"):\n        if not hasattr(typing, _name):\n            setattr(typing, _name, getattr(typing_extensions, _name))\n";
+const SITECUSTOMIZE_PY: &str = "import sys\nif sys.version_info < (3, 11):\n    import typing\n    import typing_extensions\n    for _name in (\"Self\", \"NotRequired\", \"Required\"):\n        if not hasattr(typing, _name):\n            setattr(typing, _name, getattr(typing_extensions, _name))\n    import enum\n    if not hasattr(enum, \"StrEnum\"):\n        from backports.strenum import StrEnum\n        enum.StrEnum = StrEnum\n";
 
 /// Package distribution names (wheel-filename form: non-alphanumeric runs
 /// become `_`, matched case-insensitively since wheel filenames preserve
