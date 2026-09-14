@@ -29,6 +29,17 @@ use crate::{metrics, wheelcache};
 /// Secret's `ml2_conf.ini` key directly needs no chart at all.
 const NEUTRON_ETC_SECRET_NAME: &str = "neutron-etc";
 const ML2_CONF_SECRET_KEY: &str = "ml2_conf.ini";
+/// Same Secret, different key -- `neutron-server`'s `log_config_append`
+/// target (confirmed live 2026-09-14). Its `[logger_neutron]`/
+/// `[logger_neutron_taas]` sections are the *only* loggers routed to the
+/// `stdout` handler; `[logger_root]` uses a `NullHandler`, so any logger not
+/// explicitly listed here -- including every third-party ML2 driver's own
+/// `LOG = logging.getLogger(__name__)` -- is silently swallowed regardless
+/// of level. Discovered the hard way while live-debugging the unifi driver's
+/// subnet-sync code: `neutron.plugins.ml2.managers` logged the real
+/// exception (it has its own configured logger), but the driver's own
+/// `LOG.error` calls for the exact same failure never appeared anywhere.
+const LOGGING_CONF_SECRET_KEY: &str = "logging.conf";
 
 /// The ConfigMap holding `neutron-server`'s actual startup script -- also a
 /// static, once-Helm-rendered asset (confirmed 2026-09-14: `neutron-server`
@@ -427,6 +438,128 @@ fn remove_config_dir_flag(script: &str) -> String {
     result
 }
 
+/// Adds a `[logger_<import_module>]` section to `logging.conf`, routed to
+/// the existing `stdout` handler at INFO, and adds `import_module` to the
+/// `[loggers]` section's `keys` line -- so the driver's own
+/// `logging.getLogger(__name__)` calls (a child of this qualname) actually
+/// reach stdout instead of falling through to `[logger_root]`'s
+/// `NullHandler`. Idempotent: a no-op if the section already exists.
+/// Errors (rather than guessing) if there's no `[loggers]` section with a
+/// `keys` line, matching `add_driver_to_ml2_conf`'s failure philosophy --
+/// this file has several sections with their own `keys` lines
+/// (`[formatters]`, `[handlers]`, `[loggers]`), so the edit has to be scoped
+/// to the right one rather than matching the first `keys` line found
+/// anywhere in the file.
+fn add_driver_logger_to_logging_conf(logging_conf: &str, import_module: &str) -> GuardianResult<String> {
+    let section_header = format!("[logger_{import_module}]");
+    if logging_conf.lines().any(|l| l.trim() == section_header) {
+        return Ok(logging_conf.to_string());
+    }
+
+    let mut out_lines = Vec::new();
+    let mut in_loggers_section = false;
+    let mut found_loggers_keys = false;
+
+    for line in logging_conf.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_loggers_section = trimmed == "[loggers]";
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if in_loggers_section && trimmed.starts_with("keys") {
+            found_loggers_keys = true;
+            let current = line.split('=').nth(1).unwrap_or("");
+            let mut keys: Vec<&str> = current
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !keys.contains(&import_module) {
+                keys.push(import_module);
+            }
+            out_lines.push(format!("keys = {}", keys.join(",")));
+            continue;
+        }
+        out_lines.push(line.to_string());
+    }
+
+    if !found_loggers_keys {
+        return Err(GuardianError::Config(
+            "no [loggers] section with a keys line found in logging.conf -- refusing to guess where to insert one".into(),
+        ));
+    }
+
+    let mut result = out_lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result.push_str(&format!(
+        "\n[logger_{import_module}]\nhandlers = stdout\nlevel = INFO\nqualname = {import_module}\n"
+    ));
+
+    Ok(result)
+}
+
+/// Inverse of `add_driver_logger_to_logging_conf`: removes the
+/// `[logger_<import_module>]` section entirely (every line from its header
+/// up to the next section header or EOF) and drops `import_module` from
+/// `[loggers]`'s `keys` line. Infallible and idempotent -- a no-op if the
+/// section isn't present. Also drops one immediately-preceding blank line,
+/// since `add_driver_logger_to_logging_conf` always inserts one before a
+/// new section -- needed for this to round-trip byte-for-byte back to the
+/// pre-add content, not just leave the file in a merely-equivalent state.
+fn remove_driver_logger_from_logging_conf(logging_conf: &str, import_module: &str) -> String {
+    let section_header = format!("[logger_{import_module}]");
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut skipping = false;
+    let mut in_loggers_section = false;
+
+    for line in logging_conf.lines() {
+        let trimmed = line.trim();
+        let is_header = trimmed.starts_with('[') && trimmed.ends_with(']');
+
+        if is_header {
+            if trimmed == section_header {
+                skipping = true;
+                in_loggers_section = false;
+                if out_lines.last().is_some_and(|l| l.is_empty()) {
+                    out_lines.pop();
+                }
+            } else {
+                skipping = false;
+                in_loggers_section = trimmed == "[loggers]";
+                out_lines.push(line.to_string());
+            }
+            continue;
+        }
+
+        if skipping {
+            continue;
+        }
+
+        if in_loggers_section && trimmed.starts_with("keys") {
+            let current = line.split('=').nth(1).unwrap_or("");
+            let keys: Vec<&str> = current
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && *s != import_module)
+                .collect();
+            out_lines.push(format!("keys = {}", keys.join(",")));
+            continue;
+        }
+
+        out_lines.push(line.to_string());
+    }
+
+    let mut result = out_lines.join("\n");
+    if logging_conf.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
 /// Computes (read-only -- one Secret `get` call, no mutation) a
 /// human-readable description of what `repair` would do, for `DRY_RUN`
 /// mode. Deliberately mirrors `repair`'s own logic for the mechanism_drivers
@@ -498,6 +631,32 @@ async fn revert_or_preview(
         tracing::warn!("REVERT: removed guardian-managed driver(s) from mechanism_drivers");
     }
 
+    match k8s
+        .get_secret_key(NEUTRON_ETC_SECRET_NAME, LOGGING_CONF_SECRET_KEY)
+        .await
+    {
+        Ok(current_logging_conf) => {
+            let mut new_logging_conf = current_logging_conf.clone();
+            for driver in &cfg.drivers {
+                new_logging_conf =
+                    remove_driver_logger_from_logging_conf(&new_logging_conf, &driver.import_module);
+            }
+            if new_logging_conf != current_logging_conf {
+                if let Err(e) = k8s
+                    .patch_secret_key(NEUTRON_ETC_SECRET_NAME, LOGGING_CONF_SECRET_KEY, &new_logging_conf)
+                    .await
+                {
+                    tracing::warn!(error = %e, "REVERT: failed to remove driver logger(s) from logging.conf");
+                } else {
+                    tracing::warn!("REVERT: removed guardian-managed driver logger(s) from logging.conf");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "REVERT: failed to read logging.conf");
+        }
+    }
+
     let current_script = k8s
         .get_configmap_key(NEUTRON_BIN_CONFIGMAP_NAME, NEUTRON_SERVER_SCRIPT_KEY)
         .await?;
@@ -543,9 +702,11 @@ async fn describe_intended_repair(
     let has_extra_config = driver.has_extra_config();
     Ok(format!(
         "patch secret {NEUTRON_ETC_SECRET_NAME}/{ML2_CONF_SECRET_KEY} (mechanism_drivers change: {changed}); \
+         ensure secret {NEUTRON_ETC_SECRET_NAME}/{LOGGING_CONF_SECRET_KEY} routes logger {} to stdout; \
          has extra config: {has_extra_config}{}; \
          refresh wheel cache for pip package {}; \
          patch deployment {} to inject initContainer {} + PYTHONPATH + extra-config mount, forcing a rollout",
+        driver.import_module,
         if has_extra_config {
             format!(
                 " (would also ensure --config-dir flag on {NEUTRON_BIN_CONFIGMAP_NAME}/{NEUTRON_SERVER_SCRIPT_KEY} and write its extra-config secret)"
@@ -580,6 +741,38 @@ async fn repair(
     if new_ml2_conf != current_ml2_conf {
         k8s.patch_secret_key(NEUTRON_ETC_SECRET_NAME, ML2_CONF_SECRET_KEY, &new_ml2_conf)
             .await?;
+    }
+
+    // 1b. Give the driver's own logger a route to stdout -- otherwise every
+    //     LOG.info/LOG.error call inside the driver is silently swallowed by
+    //     logging.conf's [logger_root] NullHandler (see LOGGING_CONF_SECRET_KEY's
+    //     doc comment). Best-effort: a malformed logging.conf shouldn't block
+    //     the driver itself from working, so log and continue on failure
+    //     rather than propagating -- matching the same non-fatal treatment
+    //     that a secondary/observability concern gets elsewhere in this repair.
+    match k8s
+        .get_secret_key(NEUTRON_ETC_SECRET_NAME, LOGGING_CONF_SECRET_KEY)
+        .await
+    {
+        Ok(current_logging_conf) => {
+            match add_driver_logger_to_logging_conf(&current_logging_conf, &driver.import_module) {
+                Ok(new_logging_conf) if new_logging_conf != current_logging_conf => {
+                    if let Err(e) = k8s
+                        .patch_secret_key(NEUTRON_ETC_SECRET_NAME, LOGGING_CONF_SECRET_KEY, &new_logging_conf)
+                        .await
+                    {
+                        tracing::warn!(driver = %driver.name, error = %e, "failed to patch logging.conf with driver logger");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(driver = %driver.name, error = %e, "failed to compute driver logger addition to logging.conf");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(driver = %driver.name, error = %e, "failed to read logging.conf");
+        }
     }
 
     // 2. Driver-specific extra config, if any: write its Secret, and make
@@ -775,5 +968,73 @@ function start () {
     fn remove_config_dir_flag_is_idempotent_when_absent() {
         let unchanged = remove_config_dir_flag(SAMPLE_NEUTRON_SERVER_SH);
         assert_eq!(unchanged, SAMPLE_NEUTRON_SERVER_SH);
+    }
+
+    // Trimmed but structurally faithful to the real logging.conf: multiple
+    // sections carry their own "keys = ..." line (formatters, handlers,
+    // loggers), which is exactly the ambiguity add/remove_driver_logger
+    // have to resolve correctly.
+    const SAMPLE_LOGGING_CONF: &str = "[formatters]\n\
+        keys = context,default\n\
+        [handlers]\n\
+        keys = stdout,null\n\
+        [loggers]\n\
+        keys = root,neutron\n\
+        [logger_root]\n\
+        handlers = null\n\
+        level = WARNING\n\
+        [logger_neutron]\n\
+        handlers = stdout\n\
+        level = INFO\n\
+        qualname = neutron\n";
+
+    #[test]
+    fn add_driver_logger_to_logging_conf_appends_when_missing() {
+        let updated =
+            add_driver_logger_to_logging_conf(SAMPLE_LOGGING_CONF, "unifi_ml2_driver").unwrap();
+        // Only the [loggers] section's keys line gained the new entry --
+        // [formatters]/[handlers] keys lines are untouched.
+        assert!(updated.contains("keys = context,default\n"));
+        assert!(updated.contains("keys = stdout,null\n"));
+        assert!(updated.contains("keys = root,neutron,unifi_ml2_driver"));
+        assert!(updated.contains("[logger_unifi_ml2_driver]"));
+        assert!(updated.contains("qualname = unifi_ml2_driver"));
+        assert!(updated.contains("handlers = stdout"));
+        // Existing sections preserved.
+        assert!(updated.contains("[logger_root]"));
+        assert!(updated.contains("[logger_neutron]"));
+    }
+
+    #[test]
+    fn add_driver_logger_to_logging_conf_is_idempotent() {
+        let once =
+            add_driver_logger_to_logging_conf(SAMPLE_LOGGING_CONF, "unifi_ml2_driver").unwrap();
+        let twice = add_driver_logger_to_logging_conf(&once, "unifi_ml2_driver").unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches("[logger_unifi_ml2_driver]").count(), 1);
+    }
+
+    #[test]
+    fn add_driver_logger_to_logging_conf_errors_without_loggers_section() {
+        let result = add_driver_logger_to_logging_conf(
+            "[formatters]\nkeys = default\n",
+            "unifi_ml2_driver",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remove_driver_logger_from_logging_conf_round_trips_to_original() {
+        let with_driver =
+            add_driver_logger_to_logging_conf(SAMPLE_LOGGING_CONF, "unifi_ml2_driver").unwrap();
+        let reverted = remove_driver_logger_from_logging_conf(&with_driver, "unifi_ml2_driver");
+        assert_eq!(reverted, SAMPLE_LOGGING_CONF);
+    }
+
+    #[test]
+    fn remove_driver_logger_from_logging_conf_is_idempotent_when_absent() {
+        let unchanged =
+            remove_driver_logger_from_logging_conf(SAMPLE_LOGGING_CONF, "unifi_ml2_driver");
+        assert_eq!(unchanged, SAMPLE_LOGGING_CONF);
     }
 }

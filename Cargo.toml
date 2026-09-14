@@ -1,6 +1,6 @@
 [package]
 name = "neutron-ml2-guardian"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Self-healing controller that keeps one or more third-party Neutron ML2 mechanism drivers installed and configured on a Platform9 Private Cloud Director neutron-server Helm release, without a custom container image."
 license = "Apache-2.0"
