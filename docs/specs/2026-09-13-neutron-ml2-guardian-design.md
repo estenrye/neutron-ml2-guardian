@@ -275,19 +275,22 @@ rather than silently producing a broken `mechanism_drivers` list.
 
 ## Status
 
-**The guardian mechanism itself is live-verified as of 2026-09-14; the
-`unifi-ml2-driver` it was tested against is not yet actually working.**
-A real repair loaded the driver successfully, `neutron-server` held
-`3/3 Running` under real GET-heavy API traffic with zero restarts, and
-the guardian's own present-check confirmed it via `/metrics`
-(`ml2_driver_present{driver="unifi"} 1`) -- all real, all still true. But
-the very first real `openstack network create` against that driver
-failed outright, with a genuine bug in the upstream package (see the
-"Fifth live attempt" writeup's correction, below) that none of this
-project's checks had exercised. The guardian's own job -- detect drift,
-inject a driver, keep it installed, revert cleanly on command -- is
-proven. Whether `unifi-ml2-driver` is a working driver once injected is
-a separate, still-open question. It builds cleanly (`cargo check`/`cargo
+**Fully working end to end as of 2026-09-14, confirmed against real
+production hardware.** A real `openstack network create` against a
+guardian-installed driver succeeded, and the resulting VLAN genuinely
+exists on the real UDM-SE -- confirmed directly via its own API, not
+inferred from Neutron's side alone. `neutron-server` stays healthy
+throughout, the guardian's own present-check agrees
+(`ml2_driver_present{driver="unifi"} 1`), and both create and delete
+round-trip correctly to the real device. See the "Sixth live attempt"
+writeup below for the ten real bugs (five in the driver, one in this
+project's own Terraform integration) it took to get here, each found by
+getting exactly one step further into a real network create and fixing
+exactly what broke next. This took a fork of the driver
+([estenrye/networking-unifi](https://github.com/estenrye/networking-unifi),
+published as `unifi-ml2-driver-estenrye`) since several of those bugs
+needed real code fixes upstream had no open PR for -- every fix was also
+submitted there as its own PR. It builds cleanly (`cargo check`/`cargo
 clippy -- -D warnings` both pass, 27 unit tests) and the Helm chart
 lints/renders.
 
@@ -784,17 +787,114 @@ production-hardened driver.
 **Immediate response**: reverted via the same `DRY_RUN=true` mechanism as
 every other incident this project has hit -- `neutron-server` was back to
 serving normal network CRUD within seconds, unblocking the VLAN work this
-bug had broken. **Not yet done**: a real fix (most likely, following this
-project's own established pattern, a `sitecustomize.py` addition that
-registers the missing `controller` oslo_config option with some harmless
-default -- the value doesn't matter functionally, since `self._controllers`
-is actually keyed by `CONF.unifi.host`, not `CONF.unifi.controller`, so
-this really is just a dead/leftover conditional) combined with pinning the
-wheel cache to `unifi-ml2-driver>=1.0.6` for real `apikey` support, then --
-critically -- actually exercising a real `openstack network create`
-end-to-end before calling this driver working again. Every previous
-"success" in this doc was real for what it tested, but what it tested
-turned out not to include the one thing that matters.
+bug had broken.
+
+**Sixth live attempt, 2026-09-14: forking the driver, and a real,
+complete success.** Fixing `_get_controller`'s bug outright (rather than
+working around it) meant forking `unifi-ml2-driver` --
+[estenrye/networking-unifi](https://github.com/estenrye/networking-unifi),
+published to PyPI as `unifi-ml2-driver-estenrye` (same import name and
+entry point as upstream, so it's a drop-in `pipPackage` swap) -- since
+upstream had no open PR addressing it and this project needed a working
+package now, not eventually. Every fix below was also submitted upstream
+as its own PR
+([#17](https://github.com/ubiquiti-community/networking-unifi/pull/17),
+[#18](https://github.com/ubiquiti-community/networking-unifi/pull/18),
+[#19](https://github.com/ubiquiti-community/networking-unifi/pull/19)) --
+forking to unblock this project doesn't mean the fixes should only live
+here.
+
+Getting from "the driver loads" to "a real VLAN actually appears on a
+real UDM-SE" took five more real bugs, each found by getting exactly one
+step further into an actual `openstack network create` and fixing exactly
+what broke next -- the same methodology as every fix before it in this
+doc, just aimed at a deeper layer once the shallower ones were cleared:
+
+1. **`_get_controller`'s `NoSuchOptError`** (root-caused earlier the same
+   day): `CONF.unifi.controller` was never registered; the actual dict
+   key two lines later is `CONF.unifi.host`. A likely typo -- `__init__`
+   has a dead, unused `self.controller = None` that was probably the
+   original intent. One-line fix.
+2. **`aiohttp-unifi<86` has no network/VLAN model at all.** Confirmed by
+   inspecting its `models/` directory directly: no `network.py`, no
+   `NetworkCreateRequest`. That capability was added in `86`, which *also*
+   bumped its own `requires-python` to `>=3.12.0` in the same release --
+   no version has both. Resolved not by forking `aiohttp-unifi` too, but
+   by confirming (statically, then by a real `import` inside a real
+   Python 3.10.12 pod matching the target image) that its actual code
+   doesn't need 3.12 syntax, just the same class of `typing`/`enum`
+   back-ports this project's `sitecustomize.py` shim already provides --
+   so `--ignore-requires-python` on both the wheel-cache download and the
+   install step was the real fix, not a new fork.
+3. **`asyncio.timeout` doesn't exist on Python 3.10** (added in 3.11.0).
+   `unifi_api.py`'s `get_unifi_api()` uses it directly around the login
+   call. `async_timeout` (already a real, correctly-declared transitive
+   dependency of `aiohttp` itself) provides an API-compatible drop-in;
+   `sitecustomize.py` now patches `asyncio.timeout` from it too, following
+   the same pattern as the other three symbols.
+4. **`backports.strenum` genuinely can't be discovered via normal
+   dependency resolution.** `aiohttp-unifi`'s own published metadata
+   declares only `aiohttp`, `orjson`, and `segno` -- never
+   `backports.strenum`, despite needing it on <3.11. A real gap in that
+   package's own packaging. Fixed by having `wheelcache::refresh` fetch
+   it unconditionally (`SITECUSTOMIZE_SUPPORT_PACKAGES`), not by trusting
+   it to arrive on its own.
+5. **The wheel cache directory itself never got cleared between
+   refreshes.** Switching `pipPackage` to the new fork left the *old*
+   package's entire dependency tree sitting alongside the new one, with
+   no version relationship pip could see between them -- its resolver
+   failed outright on a real conflict (two different `tooz` versions
+   "requested"). Fixed with a `rm -rf` before every refresh.
+6. **The extraConfigSecretRef Secret's key must be `<name>.ini`, not
+   `<name>.conf`.** Documented and code-enforced (`k8s/mod.rs`'s own
+   comment says so), but the new `tofu-pcd-vms` Terraform integration
+   used `.conf` anyway. A `subPath` referencing a key the Secret doesn't
+   have makes Kubernetes mount an *empty directory* instead of erroring,
+   which surfaced as `IsADirectoryError` inside neutron-server. Fixed in
+   the Terraform resource, not the guardian.
+7. **`get_unifi_api`'s SSL context used `ssl.Purpose.CLIENT_AUTH`**,
+   which configures a context for a *server* verifying incoming *client*
+   certificates -- the opposite of what's needed to make an *outgoing*
+   client connection (`ssl.Purpose.SERVER_AUTH`). With `verify_ssl` at its
+   documented default (`true`), this context could never open a client
+   socket at all, regardless of the target's certificate. One-line fix,
+   published as its own fork release (`v1.0.11`) and its own upstream PR.
+8. **The UDM-SE's self-signed certificate**, once the SSL context bug
+   above was fixed and TLS verification actually ran for the first time.
+   Not a code bug -- a real configuration requirement for this specific
+   device. Fixed by setting `verify_ssl = false` in the driver's own
+   `[unifi]` config (the same tradeoff `external-dns-unifi-webhook`,
+   mentioned in this project's original investigation, already makes for
+   the same reason).
+9. **The driver's default `port` (8443) is wrong for a UniFi OS
+   device.** Confirmed directly with `curl`: `10.45.0.1:8443` returns 404
+   for everything, while `10.45.0.1:443` (the implicit default, no port
+   needed) serves the real API. 8443 is the classic/self-hosted
+   controller port; a UniFi OS console (UDM-SE) proxies everything
+   through its own standard HTTPS port instead. Fixed with `port = 443`
+   in config -- not a driver bug, a real difference between UniFi OS
+   consoles and classic controllers that the driver's chosen default
+   doesn't account for.
+10. **`vlan_data` never set `vlan_enabled`.** `aiounifi`'s own
+    `Network.vlan` property only returns the raw `vlan` value when
+    `vlan_enabled` is also true; without it, the server treated the
+    submission as untagged, which collided with the UDM-SE's own default
+    "untagged" network (reported back as `api.err.VlanUsed`, `vlan: 1`,
+    `"Default Management Network"` -- not the VLAN actually requested,
+    which is what made this one take a moment to place). Fixed by adding
+    `"vlan_enabled": True` alongside `"vlan"` in both the create and
+    update payloads. Published as `v1.0.12` and its own upstream PR.
+
+With all ten fixed, a real `openstack network create
+--provider-network-type vlan --provider-segment 1999 guardian-test-vlan`
+succeeded end to end: Neutron returned `status: ACTIVE`, and the VLAN
+genuinely exists on the real UDM-SE -- confirmed directly via its own API
+(`GET /proxy/network/api/s/default/rest/networkconf`, finding
+`"vlan": 1999, "name": "OpenStack-<id>-VLAN1999", "enabled": true`). A
+matching `openstack network delete` cleanly removed it from the UDM-SE
+too, confirmed the same way. This is the original goal from the very
+first message in this project's history, working, for real, against
+production hardware.
 
 ## Automated revert: `DRY_RUN=true` now means "zero footprint," not just "don't touch anything"
 

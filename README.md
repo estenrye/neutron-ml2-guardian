@@ -52,15 +52,18 @@ deploymentName: neutron-server
 ml2Drivers:
   - name: unifi                              # the mechanism_drivers/stevedore name
     pipPackage: unifi-ml2-driver-estenrye    # pip-installable package -- github.com/estenrye/networking-unifi,
-                                              # a fork fixing a real crash-on-every-network-create bug and a
-                                              # requires-python constraint tighter than the code actually needs
-                                              # (see the design doc); same import name/entry point as upstream
+                                              # a fork fixing three real bugs and a requires-python constraint
+                                              # tighter than the code actually needs (see the design doc's
+                                              # "Sixth live attempt"); same import name/entry point as upstream
     importModule: unifi_ml2_driver           # top-level module to test-import
     extraConfigSecretData: |           # opaque -- never parsed by the guardian
       [unifi]
       host = 10.45.0.1                 # real, verified reachable UDM-SE address for this cluster
+      port = 443                       # required for a UDM-SE -- its default (8443) is the classic/
+                                        # self-hosted-controller port, not a UniFi OS console's
       apikey = REPLACE_ME
       site = default
+      verify_ssl = false               # required -- UDM-SEs use a self-signed certificate
 ```
 
 Add more entries to guard multiple drivers with the same controller. See
@@ -121,27 +124,29 @@ do -- in either direction.
 
 ## Status
 
-**The guardian's own repair/detect/revert mechanism is live-verified
-end to end against a real `pcd.rye.ninja` cluster with `DRY_RUN=false`,
-2026-09-14 -- the `unifi-ml2-driver` it was tested against is not yet
-actually working, though.** A real repair loaded the driver
-successfully, `neutron-server` held `3/3 Running` with zero restarts,
-and the guardian's own post-repair check confirmed it via `/metrics`
-(`ml2_driver_present{driver="unifi"} 1`) -- but that traffic was all
-GET requests, and the driver only does anything on a real `openstack
-network create`. The first one of those against this driver failed
-outright with a genuine bug in the upstream package (see the design
-doc's "Fifth live attempt" correction). Getting to that point surfaced
-(and fixed) several other real bugs along the way -- a
-dependency-shadowing crash, three separate Python-3.11-only symbols an
-upstream driver dependency assumed were available, and an RBAC verb
+**Fully working end to end, confirmed against real production
+hardware, 2026-09-14.** A real `openstack network create` against a
+guardian-installed `unifi` driver succeeded, and the resulting VLAN
+genuinely exists on the real UDM-SE -- confirmed directly via its own
+API, both for create and delete. `neutron-server` stays healthy
+throughout and the guardian's own post-repair check agrees
+(`ml2_driver_present{driver="unifi"} 1`). Getting here took ten real
+bugs found live, one crash/config-gap at a time -- a
+dependency-shadowing crash, four separate Python-3.11-only gaps an
+upstream driver dependency assumed were available, an RBAC verb
 mismatch between `kubectl`'s exec transport and this project's
-WebSocket-based one -- each one caught live and recovered via the
-automated `DRY_RUN=true` revert described below, which has now been
-exercised as a genuine incident-recovery mechanism (including for the
-still-open driver bug above) several times, not just tested
-synthetically. See the design doc's "Status" section for the full
-blow-by-blow.
+WebSocket-based one, a Terraform config bug in this project's own
+`extraConfigSecretRef` wiring, and three real bugs in the driver itself
+(a bad config-option reference, a backwards SSL purpose, and a missing
+`vlan_enabled` flag) that needed a fork
+([estenrye/networking-unifi](https://github.com/estenrye/networking-unifi),
+published as `unifi-ml2-driver-estenrye`) to fix now rather than wait on
+upstream -- every one of those was also submitted there as its own PR.
+Each bug was caught live and, where it mattered, recovered via the
+automated `DRY_RUN=true` revert described below, exercised repeatedly as
+a genuine incident-recovery mechanism, not just tested synthetically.
+See the design doc's "Status" section (the "Sixth live attempt"
+writeup) for the full blow-by-blow.
 
 It builds clean (`cargo check`, `cargo clippy -- -D warnings`), has a
 27-test suite covering every pure-function piece (including a smoke test

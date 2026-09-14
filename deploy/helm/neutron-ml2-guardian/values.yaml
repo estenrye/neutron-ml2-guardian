@@ -85,17 +85,25 @@ ml2Drivers: []
 # the PCD host and from inside a pod's own network namespace in this
 # cluster, 2026-09-14). pipPackage is unifi-ml2-driver-estenrye, not
 # upstream's unifi-ml2-driver -- same import name and entry point (drop-in
-# otherwise), but fixes a real crash-on-every-network-create bug and
-# relaxes requires-python to what the code actually needs; see
+# otherwise), but fixes three real bugs (a bad config-option reference, a
+# backwards SSL purpose, a missing vlan_enabled flag) and relaxes
+# requires-python to what the code actually needs; see
 # github.com/estenrye/networking-unifi and this doc's design spec's
-# "Fifth live attempt" correction for the full story.
+# "Sixth live attempt" writeup for the full story -- including why
+# `port = 443` and `verify_ssl = false` below are both required, not
+# optional, for a real UDM-SE (its default is 8443, the classic
+# self-hosted-controller port; a UniFi OS console like a UDM-SE proxies
+# everything through its own standard HTTPS port instead, with a
+# self-signed certificate).
 #
 #   kubectl create secret generic neutron-ml2-unifi-external-config \
 #     -n pcd --from-literal=unifi.ini="$(cat <<EOF
 #   [unifi]
 #   host = 10.45.0.1
+#   port = 443
 #   apikey = <the real key>
 #   site = default
+#   verify_ssl = false
 #   EOF
 #   )"
 #
@@ -113,8 +121,10 @@ ml2Drivers: []
 #     extraConfigSecretData: |
 #       [unifi]
 #       host = 10.45.0.1
+#       port = 443
 #       apikey = REPLACE_ME
 #       site = default
+#       verify_ssl = false
 
 resources:
   requests:
