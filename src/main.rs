@@ -6,8 +6,9 @@ mod reconcile;
 mod telemetry;
 mod wheelcache;
 
-use axum::{routing::get, Router};
+use axum::{http::header::CONTENT_TYPE, response::IntoResponse, routing::get, Router};
 use kube::Client;
+use prometheus::{Encoder, TextEncoder};
 
 use config::Config;
 use k8s::K8s;
@@ -74,15 +75,29 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Placeholder `/metrics` handler. OTLP metric export (when
-/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set) already ships metrics to a
-/// collector independent of this route; a real Prometheus-scrape-format
-/// endpoint (via `opentelemetry-prometheus` or a dedicated `prometheus`
-/// crate registry) is a follow-up -- see the design doc's "Observability
-/// rides on PCD's own stack" note, which assumes this route exists and is
-/// scraped directly, not yet wired up in this first pass.
-async fn metrics_handler() -> &'static str {
-    "# neutron-ml2-guardian: Prometheus text-format export not yet implemented; use OTLP export via OTEL_EXPORTER_OTLP_ENDPOINT in the meantime.\n"
+/// Gathers `metrics::registry()` into Prometheus text-exposition format --
+/// what a cluster's existing Prometheus (annotation-scraping this pod, see
+/// the Helm chart's Deployment template) actually expects at `/metrics`.
+/// Independent of OTLP export: metrics are recorded into both on every
+/// event (see `metrics.rs`'s module doc comment for why), so this route
+/// works whether or not `OTEL_EXPORTER_OTLP_ENDPOINT` is also configured.
+async fn metrics_handler() -> impl IntoResponse {
+    let metric_families = metrics::registry().gather();
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        tracing::error!(error = %e, "failed to encode Prometheus metrics");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            [(CONTENT_TYPE, "text/plain".to_string())],
+            Vec::new(),
+        );
+    }
+    (
+        axum::http::StatusCode::OK,
+        [(CONTENT_TYPE, encoder.format_type().to_string())],
+        buffer,
+    )
 }
 
 async fn shutdown_signal() {

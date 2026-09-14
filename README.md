@@ -105,18 +105,22 @@ shouldn't run unattended before you've seen what it intends to do.
 
 ## Status
 
-**First-pass implementation, not yet run against a real cluster with
-`DRY_RUN=false`.** It builds clean (`cargo check`, `cargo clippy -- -D
-warnings`) and the Helm chart lints/renders. Verified against the live
-cluster: `PYTHONPATH` propagation, the real container name, and (via a
-manual, `--dry-run`-only reproduction) that patching `neutron-etc`'s
-`ml2_conf.ini` key directly is the right approach -- the originally-planned
-`helm upgrade` route turned out to be a dead end (Helm can't recover
-subchart data from its own release storage) and was replaced. Remaining
-gaps: no real Prometheus `/metrics` handler yet, no test suite, and a
-driver needing its own `extraConfigSecretData` isn't fully wired in yet
-(the Secret gets created but nothing mounts it into `neutron-server` yet) --
-see the design doc's "Status" section for the full list.
+**Implementation complete for a first pass; not yet run against a real
+cluster with `DRY_RUN=false`.** It builds clean (`cargo check`, `cargo
+clippy -- -D warnings`), has a 17-test suite covering every pure-function
+piece (including a smoke test that gathers+encodes real Prometheus text,
+not just that instrument registration doesn't panic), and the Helm chart
+lints/renders. Verified against the live cluster: `PYTHONPATH` propagation,
+the real container/ConfigMap/Secret names involved, and (via manual,
+`--dry-run`-only reproductions) that patching `neutron-etc`'s
+`ml2_conf.ini` and `neutron-bin`'s `neutron-server.sh` directly is the
+right approach -- the originally-planned `helm upgrade` route turned out to
+be a dead end (Helm can't recover subchart data from its own release
+storage) and was replaced. `extraConfigSecretData` is now fully wired
+(mounted via a `--config-dir` oslo.config scans automatically) and
+`/metrics` returns real Prometheus text format. The one remaining gap: the
+Rust code path itself has never performed a real repair end-to-end -- see
+the design doc's "Status" section for the full detail.
 
 ## Building and running
 

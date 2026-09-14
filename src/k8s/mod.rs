@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::{
     apps::v1::Deployment,
-    core::v1::{Pod, Secret},
+    core::v1::{ConfigMap, Pod, Secret},
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, Patch, PatchParams};
@@ -35,6 +35,19 @@ const PLUGIN_VOLUME_NAME: &str = "ml2-driver-plugins";
 const PLUGIN_MOUNT_PATH: &str = "/opt/ml2-plugins";
 const WHEELCACHE_VOLUME_NAME: &str = "ml2-wheelcache";
 const WHEELCACHE_MOUNT_PATH: &str = "/wheelcache";
+
+/// Directory oslo.config scans for extra `*.conf` files, once `--config-dir`
+/// is added to `neutron-server.sh` (see `reconcile::add_config_dir_flag`).
+/// Each driver with non-empty `extraConfigSecretData` gets its own file
+/// mounted here by `apply_injection_patch`.
+pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
+
+/// Name of the per-driver extra-config Secret `write_driver_config_secret`
+/// creates and `apply_injection_patch` mounts -- factored out so the two
+/// can't drift out of sync with each other.
+fn driver_config_secret_name(driver_name: &str) -> String {
+    format!("neutron-ml2-{driver_name}-config")
+}
 
 pub struct K8s {
     client: Client,
@@ -59,6 +72,10 @@ impl K8s {
     }
 
     fn secrets(&self) -> Api<Secret> {
+        Api::namespaced(self.client.clone(), &self.namespace)
+    }
+
+    fn configmaps(&self) -> Api<ConfigMap> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
@@ -237,6 +254,44 @@ impl K8s {
             .as_secs()
             .to_string();
 
+        // One volume + volumeMount per driver that actually has extra
+        // config -- mounted into EXTRA_CONF_DIR, which neutron-server.sh's
+        // --config-dir flag (added once by reconcile::add_config_dir_flag)
+        // scans for *.conf files. subPath must match the Secret's own key
+        // (write_driver_config_secret uses "<name>.ini"); mountPath is free
+        // to end in .conf instead, since oslo.config only globs by the
+        // *mounted* filename, not the Secret's internal key name.
+        let mut extra_config_volumes = Vec::new();
+        let mut extra_config_mounts = Vec::new();
+        for driver in drivers
+            .iter()
+            .filter(|d| !d.extra_config_secret_data.is_empty())
+        {
+            let volume_name = format!("ml2-extra-config-{}", driver.name);
+            extra_config_volumes.push(json!({
+                "name": volume_name,
+                "secret": { "secretName": driver_config_secret_name(&driver.name) },
+            }));
+            extra_config_mounts.push(json!({
+                "name": volume_name,
+                "mountPath": format!("{EXTRA_CONF_DIR}/{}.conf", driver.name),
+                "subPath": format!("{}.ini", driver.name),
+                "readOnly": true,
+            }));
+        }
+
+        let mut volumes = vec![
+            json!({ "name": PLUGIN_VOLUME_NAME, "emptyDir": {} }),
+            json!({ "name": WHEELCACHE_VOLUME_NAME, "persistentVolumeClaim": { "claimName": wheelcache_pvc, "readOnly": true } }),
+        ];
+        volumes.extend(extra_config_volumes);
+
+        let mut main_container_mounts = vec![json!({
+            "name": PLUGIN_VOLUME_NAME,
+            "mountPath": PLUGIN_MOUNT_PATH,
+        })];
+        main_container_mounts.extend(extra_config_mounts);
+
         let patch = json!({
             "spec": {
                 "template": {
@@ -246,10 +301,7 @@ impl K8s {
                         }
                     },
                     "spec": {
-                        "volumes": [
-                            { "name": PLUGIN_VOLUME_NAME, "emptyDir": {} },
-                            { "name": WHEELCACHE_VOLUME_NAME, "persistentVolumeClaim": { "claimName": wheelcache_pvc, "readOnly": true } },
-                        ],
+                        "volumes": volumes,
                         "initContainers": [
                             {
                                 "name": INJECTOR_CONTAINER_NAME,
@@ -267,9 +319,7 @@ impl K8s {
                                 "env": [
                                     { "name": "PYTHONPATH", "value": PLUGIN_MOUNT_PATH }
                                 ],
-                                "volumeMounts": [
-                                    { "name": PLUGIN_VOLUME_NAME, "mountPath": PLUGIN_MOUNT_PATH },
-                                ],
+                                "volumeMounts": main_container_mounts,
                             }
                         ]
                     }
@@ -338,13 +388,56 @@ impl K8s {
         Ok(())
     }
 
+    /// ConfigMap analog of `get_secret_key` -- used to read
+    /// `neutron-server.sh` out of the `neutron-bin` ConfigMap.
+    pub async fn get_configmap_key(&self, name: &str, key: &str) -> GuardianResult<String> {
+        let cm = self.configmaps().get(name).await?;
+        cm.data
+            .as_ref()
+            .and_then(|d| d.get(key))
+            .cloned()
+            .ok_or_else(|| GuardianError::Config(format!("configmap {name} has no key {key}")))
+    }
+
+    /// ConfigMap analog of `patch_secret_key` -- used to add the
+    /// `--config-dir` flag to `neutron-server.sh` inside `neutron-bin`.
+    /// Same caveat as `patch_secret_key`: owned by the `neutron` Helm
+    /// release, and a subsequent real `helm upgrade` can and will overwrite
+    /// this again -- expected, not a bug.
+    pub async fn patch_configmap_key(
+        &self,
+        name: &str,
+        key: &str,
+        value: &str,
+    ) -> GuardianResult<()> {
+        let mut data = BTreeMap::new();
+        data.insert(key.to_string(), value.to_string());
+        let patch = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(self.namespace.clone()),
+                ..Default::default()
+            },
+            data: Some(data),
+            ..Default::default()
+        };
+        self.configmaps()
+            .patch(
+                name,
+                &PatchParams::apply("neutron-ml2-guardian"),
+                &Patch::Apply(patch),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Writes (or updates) the per-driver extra-config Secret. Content is
     /// opaque to the guardian -- see `DriverSpec::extra_config_secret_data`.
     pub async fn write_driver_config_secret(&self, driver: &DriverSpec) -> GuardianResult<()> {
         if driver.extra_config_secret_data.is_empty() {
             return Ok(());
         }
-        let name = format!("neutron-ml2-{}-config", driver.name);
+        let name = driver_config_secret_name(&driver.name);
         let mut data = BTreeMap::new();
         data.insert(
             format!("{}.ini", driver.name),

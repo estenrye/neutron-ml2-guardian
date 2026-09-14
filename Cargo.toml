@@ -23,6 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "1"
 anyhow = "1"
 regex = "1"
+prometheus = "0.13"
 opentelemetry = { version = "0.32.0", features = ["trace", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "trace", "metrics", "logs"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs", "tls-roots"] }

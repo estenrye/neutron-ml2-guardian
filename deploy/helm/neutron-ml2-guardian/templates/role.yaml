@@ -46,6 +46,15 @@ rules:
     resources: ["secrets"]
     verbs: ["get", "patch", "create"]
 
+  # neutron-bin (the ConfigMap holding neutron-server.sh, the startup
+  # script neutron-server is actually launched with) -- patched once to add
+  # a --config-dir flag when a driver needs extraConfigSecretData, see
+  # reconcile::add_config_dir_flag.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["neutron-bin"]
+    verbs: ["get", "patch"]
+
   # The wheel-download Job, created fresh on each cache refresh, and its
   # pod's logs (read via pods/log above) for the filename list it produced.
   - apiGroups: ["batch"]

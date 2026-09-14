@@ -12,7 +12,7 @@ use kube::Client;
 
 use crate::config::{Config, DriverSpec};
 use crate::error::{GuardianError, GuardianResult};
-use crate::k8s::K8s;
+use crate::k8s::{K8s, EXTRA_CONF_DIR};
 use crate::{metrics, wheelcache};
 
 /// Name of the Secret that holds every rendered Neutron config file as
@@ -29,6 +29,27 @@ use crate::{metrics, wheelcache};
 /// Secret's `ml2_conf.ini` key directly needs no chart at all.
 const NEUTRON_ETC_SECRET_NAME: &str = "neutron-etc";
 const ML2_CONF_SECRET_KEY: &str = "ml2_conf.ini";
+
+/// The ConfigMap holding `neutron-server`'s actual startup script -- also a
+/// static, once-Helm-rendered asset (confirmed 2026-09-14: `neutron-server`
+/// is launched via `["/tmp/neutron-server.sh", "start"]`, itself mounted
+/// from this ConfigMap, which `exec`s `neutron-server` with a fixed list of
+/// `--config-file` flags and no `--config-dir`). Patched the same way as
+/// `neutron-etc` above, once, to add a `--config-dir` flag -- after that,
+/// wiring in a new driver's `extraConfigSecretData` never needs to touch
+/// this script again, since oslo.config loads every `*.conf` file it finds
+/// under a `--config-dir` automatically; only the injection patch's volume
+/// mounts need to change per driver, not this script.
+const NEUTRON_BIN_CONFIGMAP_NAME: &str = "neutron-bin";
+const NEUTRON_SERVER_SCRIPT_KEY: &str = "neutron-server.sh";
+/// Exact line confirmed live in `neutron-server.sh` -- the last
+/// `--config-file` in its `neutron-server` invocation, with no trailing
+/// line continuation. Anchoring on this specific text (rather than a
+/// generic "last --config-file line" scan) is deliberate: if PCD ever
+/// changes this script's shape, silently guessing where to insert a new
+/// flag risks corrupting how Neutron starts at all -- better to fail loudly
+/// (see `add_config_dir_flag`) than to guess.
+const ML2_CONF_FILE_FLAG_LINE: &str = "        --config-file /etc/neutron/plugins/ml2/ml2_conf.ini";
 
 /// After this many consecutive failed repairs for a given driver, stop
 /// attempting further repairs until the process restarts (a deliberate,
@@ -269,6 +290,44 @@ fn add_driver_to_ml2_conf(ml2_conf: &str, driver_name: &str) -> GuardianResult<S
     Ok(result)
 }
 
+/// Adds a `--config-dir EXTRA_CONF_DIR` line to `neutron-server.sh`'s
+/// `neutron-server` invocation, right after the known last `--config-file`
+/// line -- a one-time change; once present, per-driver extra config never
+/// needs another script edit (see `EXTRA_CONF_DIR`'s doc comment).
+/// Idempotent: a no-op if the flag is already there. Errors (rather than
+/// guessing) if the anchor line isn't found verbatim -- see
+/// `ML2_CONF_FILE_FLAG_LINE`'s doc comment for why that's the safer
+/// failure mode here.
+fn add_config_dir_flag(script: &str) -> GuardianResult<String> {
+    if script.contains(&format!("--config-dir {EXTRA_CONF_DIR}")) {
+        return Ok(script.to_string());
+    }
+
+    let mut found = false;
+    let mut out_lines = Vec::new();
+    for line in script.lines() {
+        if line == ML2_CONF_FILE_FLAG_LINE {
+            found = true;
+            out_lines.push(format!("{line} \\"));
+            out_lines.push(format!("        --config-dir {EXTRA_CONF_DIR}"));
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+
+    if !found {
+        return Err(GuardianError::Config(format!(
+            "neutron-server.sh didn't contain the expected anchor line ({ML2_CONF_FILE_FLAG_LINE:?}) -- refusing to guess where to insert --config-dir"
+        )));
+    }
+
+    let mut result = out_lines.join("\n");
+    if script.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
+}
+
 /// Computes (read-only -- one Secret `get` call, no mutation) a
 /// human-readable description of what `repair` would do, for `DRY_RUN`
 /// mode. Deliberately mirrors `repair`'s own logic for the mechanism_drivers
@@ -285,12 +344,19 @@ async fn describe_intended_repair(
     let new_ml2_conf = add_driver_to_ml2_conf(&current_ml2_conf, &driver.name)?;
     let changed = new_ml2_conf != current_ml2_conf;
 
+    let has_extra_config = !driver.extra_config_secret_data.is_empty();
     Ok(format!(
         "patch secret {NEUTRON_ETC_SECRET_NAME}/{ML2_CONF_SECRET_KEY} (mechanism_drivers change: {changed}); \
-         write extra-config secret: {}; \
+         has extra config: {has_extra_config}{}; \
          refresh wheel cache for pip package {}; \
-         patch deployment {} to inject initContainer {} + PYTHONPATH, forcing a rollout",
-        !driver.extra_config_secret_data.is_empty(),
+         patch deployment {} to inject initContainer {} + PYTHONPATH + extra-config mount, forcing a rollout",
+        if has_extra_config {
+            format!(
+                " (would also ensure --config-dir flag on {NEUTRON_BIN_CONFIGMAP_NAME}/{NEUTRON_SERVER_SCRIPT_KEY} and write its extra-config secret)"
+            )
+        } else {
+            String::new()
+        },
         driver.pip_package,
         cfg.deployment_name,
         crate::k8s::INJECTOR_CONTAINER_NAME,
@@ -320,8 +386,26 @@ async fn repair(
             .await?;
     }
 
-    // 2. Driver-specific extra config, if any.
-    k8s.write_driver_config_secret(driver).await?;
+    // 2. Driver-specific extra config, if any: write its Secret, and make
+    //    sure neutron-server.sh actually loads *.conf files from
+    //    EXTRA_CONF_DIR at all (a one-time change per script -- see
+    //    add_config_dir_flag; harmless/idempotent to re-check every time a
+    //    driver with extra config repairs).
+    if !driver.extra_config_secret_data.is_empty() {
+        let current_script = k8s
+            .get_configmap_key(NEUTRON_BIN_CONFIGMAP_NAME, NEUTRON_SERVER_SCRIPT_KEY)
+            .await?;
+        let new_script = add_config_dir_flag(&current_script)?;
+        if new_script != current_script {
+            k8s.patch_configmap_key(
+                NEUTRON_BIN_CONFIGMAP_NAME,
+                NEUTRON_SERVER_SCRIPT_KEY,
+                &new_script,
+            )
+            .await?;
+        }
+        k8s.write_driver_config_secret(driver).await?;
+    }
 
     // 3. Wheel cache, refreshed against whatever image is currently
     //    running, then classified so future ticks know whether a refresh
@@ -419,6 +503,39 @@ mod tests {
     #[test]
     fn add_driver_to_ml2_conf_errors_without_mechanism_drivers_line() {
         let result = add_driver_to_ml2_conf("[ml2]\ntype_drivers = vlan\n", "unifi");
+        assert!(result.is_err());
+    }
+
+    const SAMPLE_NEUTRON_SERVER_SH: &str = r#"#!/bin/bash
+
+function start () {
+  exec neutron-server \
+        --config-file /etc/neutron/neutron.conf \
+        --config-file /tmp/pod-shared/ovn.ini \
+        --config-file /etc/neutron/plugins/ml2/ml2_conf.ini
+}
+"#;
+
+    #[test]
+    fn add_config_dir_flag_inserts_after_anchor_line() {
+        let updated = add_config_dir_flag(SAMPLE_NEUTRON_SERVER_SH).unwrap();
+        assert!(updated.contains(&format!("--config-dir {EXTRA_CONF_DIR}")));
+        // The anchor line itself is preserved, just gains a continuation.
+        assert!(updated.contains(&format!("{ML2_CONF_FILE_FLAG_LINE} \\")));
+        // Everything else untouched.
+        assert!(updated.contains("--config-file /etc/neutron/neutron.conf"));
+    }
+
+    #[test]
+    fn add_config_dir_flag_is_idempotent() {
+        let once = add_config_dir_flag(SAMPLE_NEUTRON_SERVER_SH).unwrap();
+        let twice = add_config_dir_flag(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn add_config_dir_flag_errors_without_anchor_line() {
+        let result = add_config_dir_flag("#!/bin/bash\nexec neutron-server\n");
         assert!(result.is_err());
     }
 }

@@ -308,22 +308,44 @@ where `wheelcache.storageClassName` must be overridden to a real RWX class
 (NFS-backed, etc.) -- still a plain overridable values field, just with a
 different default than "empty."
 
+**Resolved 2026-09-14 (continued):**
+- **`extraConfigSecretData` is now wired in.** `neutron-server` is actually
+  launched by a static script (`neutron-server.sh`, itself a key in the
+  `neutron-bin` ConfigMap -- confirmed live: the container's `command` is
+  `["/tmp/neutron-server.sh", "start"]`) that `exec`s `neutron-server` with
+  a fixed list of `--config-file` flags and no `--config-dir`.
+  `reconcile::add_config_dir_flag` patches that script once (same
+  patch-a-static-asset pattern as `neutron-etc`, applied to a ConfigMap
+  instead of a Secret) to add `--config-dir EXTRA_CONF_DIR`; from then on,
+  `apply_injection_patch` mounts each driver's extra-config Secret as
+  `EXTRA_CONF_DIR/<driver>.conf` (subPath matching the Secret's own
+  `<driver>.ini` key, mountPath renamed to end in `.conf` since oslo.config
+  globs `--config-dir` by that extension) -- no further script edits needed
+  as drivers are added, since oslo.config loads every `*.conf` file it
+  finds there automatically.
+- **A real Prometheus text-format `/metrics` handler.** Metrics are now
+  recorded twice on every event -- once via the existing OTel instruments
+  (OTLP export, unchanged) and once via a plain `prometheus::Registry`,
+  gathered into real Prometheus text format for `/metrics`
+  (`main::metrics_handler`). Deliberately two separate instrumentation
+  calls rather than one bridged through the other, to avoid coupling this
+  controller to a specific `opentelemetry`-ecosystem crate version for
+  Prometheus export specifically.
+- **A test suite now exists** (17 tests): `add_driver_to_ml2_conf`,
+  `add_config_dir_flag`, `wheelcache::classify`, driver-config YAML
+  parsing, `validate_sole_drivers`, and an end-to-end smoke test that
+  actually gathers+encodes the Prometheus registry and checks the real
+  output text, not just that instrument registration doesn't panic.
+
 **Still open before this is safe to actually run:**
-- A real Prometheus text-format `/metrics` handler (OTLP export works
-  today; the annotated-scrape path doesn't yet).
-- No test suite yet -- `reconcile::add_driver_to_ml2_conf`,
-  `wheelcache::classify`, and the driver-config YAML parsing are all pure
-  functions and should be the first ones covered, since they need no live
-  cluster.
-- **`extraConfigSecretData` is written but never wired in.**
-  `k8s::write_driver_config_secret` creates the per-driver Secret, but
-  nothing yet mounts it or adds the corresponding `--config-file` argument
-  to the `neutron-server` process -- the "Generalizing" section above
-  describes the intended design, but `apply_injection_patch` doesn't
-  implement that part yet. A driver needing no extra config (just being
-  listed in `mechanism_drivers`) works today; one that needs its own config
-  section does not yet.
 - **Never actually run with `DRY_RUN=false`.** Everything in "Repair logic"
   above is implemented and compiles, and the underlying Secret-patch
-  mechanism was validated by hand against the live cluster, but the Rust
-  code path itself has not yet performed a real repair end-to-end.
+  mechanism (including the `--config-dir` addition) was validated by hand
+  against the live cluster, but the Rust code path itself has not yet
+  performed a real repair end-to-end.
+- The `add_config_dir_flag` anchor-line match
+  (`ML2_CONF_FILE_FLAG_LINE`) was captured from `neutron-server.sh`'s
+  observed content on 2026-09-14 but hasn't been re-verified since the
+  extra-config wiring was added -- worth one more live diff before
+  `DRY_RUN=false`, in case anything about that script's exact formatting
+  was misremembered.
