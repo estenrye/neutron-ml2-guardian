@@ -58,6 +58,21 @@ const WHEELCACHE_MOUNT_PATH: &str = "/wheelcache";
 /// Secret or a user-provided `extraConfigSecretRef`.
 pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 
+/// Back-ports `typing.Self` (PEP 673, Python 3.11+) onto the real `typing`
+/// module when running under an older interpreter, from the
+/// `typing_extensions` backport already assumed present in the target image
+/// (see `ASSUMED_PRESENT_PACKAGES`). Written into `PLUGIN_MOUNT_PATH` as
+/// `sitecustomize.py`, which Python's `site` module auto-imports at
+/// interpreter startup for anything importable on `sys.path` -- PYTHONPATH
+/// included -- so this runs before neutron-server loads any mechanism
+/// driver. A single-line string with explicit `\n`s, deliberately not
+/// spread across source lines with `\`-continuations: Rust's line
+/// continuation strips *all* leading whitespace from the next source line,
+/// which silently ate this script's indentation the first time and produced
+/// an `IndentationError` -- confirmed live, see the design doc's incident
+/// writeup.
+const SITECUSTOMIZE_PY: &str = "import sys\nif sys.version_info < (3, 11):\n    import typing\n    if not hasattr(typing, \"Self\"):\n        import typing_extensions\n        typing.Self = typing_extensions.Self\n";
+
 /// Package distribution names (wheel-filename form: non-alphanumeric runs
 /// become `_`, matched case-insensitively since wheel filenames preserve
 /// original casing like `SQLAlchemy`/`WebOb`) assumed already present in
@@ -403,34 +418,17 @@ impl K8s {
         // other module in the same package, which does guard it. `Self` was
         // added to `typing` in Python 3.11 (PEP 673); this target image runs
         // 3.10, so those three imports raise `ImportError` and take down
-        // ML2's mechanism-driver loading with them. This is a real upstream
-        // bug in that dependency, not something fixable via the exclusion
-        // list above (the package itself must be installed -- it's the
-        // driver's own transitive dependency, not something already present
-        // in the base image). Rather than patch that one package's files (a
-        // per-driver, per-version-fragile fix), write a `sitecustomize.py`
-        // into the installed-plugins directory: Python's `site` module
-        // auto-imports `sitecustomize` if it's importable on `sys.path` at
-        // interpreter startup, regardless of how that path entry got there
-        // (PYTHONPATH included) -- so this runs before neutron-server loads
-        // any mechanism driver, and back-ports `Self` onto the real `typing`
-        // module from the already-present `typing_extensions` when running
-        // under <3.11. General on purpose: any future driver hitting the
-        // same Python-version gap in one of its own dependencies is covered
-        // for free, with no per-driver knowledge needed here.
+        // ML2's mechanism-driver loading with them. A real upstream bug in
+        // that dependency, not something fixable via the exclusion list
+        // above (the package itself must be installed -- it's the driver's
+        // own transitive dependency, not something already present in the
+        // base image). See `SITECUSTOMIZE_PY`'s doc comment for the fix.
         let install_cmd = format!(
             "mkdir -p {PLUGIN_MOUNT_PATH} && \
              find {WHEELCACHE_MOUNT_PATH} -mindepth 2 -maxdepth 2 -name '*.whl' \
              | grep -Eiv '/({})-[0-9]' \
              | xargs -r pip install --no-index --no-deps --target={PLUGIN_MOUNT_PATH} && \
-             cat > {PLUGIN_MOUNT_PATH}/sitecustomize.py <<'PYEOF'\n\
-import sys\n\
-if sys.version_info < (3, 11):\n\
-    import typing\n\
-    if not hasattr(typing, \"Self\"):\n\
-        import typing_extensions\n\
-        typing.Self = typing_extensions.Self\n\
-PYEOF",
+             cat > {PLUGIN_MOUNT_PATH}/sitecustomize.py <<'PYEOF'\n{SITECUSTOMIZE_PY}PYEOF",
             ASSUMED_PRESENT_PACKAGES.join("|"),
         );
 
