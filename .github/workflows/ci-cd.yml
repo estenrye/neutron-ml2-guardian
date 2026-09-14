@@ -77,10 +77,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Packages and publishes the Helm chart as an OCI artifact to Docker Hub
-  # (oci://registry-1.docker.io/estenrye/charts), gated to real releases
-  # only -- chart versions should track app releases, not every branch
-  # push.
+  # Packages and publishes the Helm chart as an OCI artifact to Docker Hub,
+  # under docker.io/estenrye/neutron-ml2-guardian-chart (see the renaming
+  # note in "Package chart" below for why it isn't the same repo as the
+  # container image), gated to real releases only -- chart versions should
+  # track app releases, not every branch push.
   helm:
     name: Package & push Helm chart
     needs: docker
@@ -103,7 +104,26 @@ jobs:
           CHART_VERSION: ${{ github.ref_name }}
         run: |
           chart_version="${CHART_VERSION#v}"
-          helm package deploy/helm/neutron-ml2-guardian \
+          # Packaged from a copy with the Chart.yaml `name:` suffixed, not
+          # from deploy/helm/neutron-ml2-guardian directly -- Docker Hub
+          # repos are a flat `namespace/repo` (two segments only; no
+          # `estenrye/charts/neutron-ml2-guardian`-style nesting, confirmed
+          # live via a 401 on that path), and `helm push` always derives
+          # its destination repo from the packaged chart's own `name:`
+          # field appended to whatever OCI ref it's given -- so pushing
+          # this chart under its real name to any ref based on
+          # `oci://registry-1.docker.io/estenrye` lands on
+          # `estenrye/neutron-ml2-guardian`, the exact repo:tag the docker
+          # job above just pushed the container image to. Confirmed live,
+          # 2026-09-14: this silently clobbered the v0.1.0 container image
+          # manifest with the chart's, since OCI tags aren't namespaced by
+          # artifact type. The installed chart's own `name:` (what
+          # `helm install` and this repo's README/values.yaml reference)
+          # is untouched -- only this OCI-publish copy is renamed.
+          cp -r deploy/helm/neutron-ml2-guardian /tmp/chart-oci-publish
+          sed -i 's/^name: neutron-ml2-guardian$/name: neutron-ml2-guardian-chart/' \
+            /tmp/chart-oci-publish/Chart.yaml
+          helm package /tmp/chart-oci-publish \
             --version "$chart_version" \
             --app-version "$chart_version" \
             --destination .helm-dist
@@ -116,12 +136,4 @@ jobs:
           helm registry login registry-1.docker.io \
             --username "$DOCKERHUB_USERNAME" \
             --password "$DOCKERHUB_TOKEN"
-          # A bare `oci://registry-1.docker.io/estenrye` destination resolves
-          # to `estenrye/neutron-ml2-guardian:<version>` (helm appends the
-          # chart name and version automatically) -- the exact same
-          # repo:tag the docker job above just pushed the container image
-          # to. Confirmed live, 2026-09-14: this silently clobbered the
-          # v0.1.0 container image manifest with the chart's, since OCI
-          # tags aren't namespaced by artifact type. `charts/` keeps the
-          # two on separate paths.
-          helm push .helm-dist/*.tgz oci://registry-1.docker.io/estenrye/charts
+          helm push .helm-dist/*.tgz oci://registry-1.docker.io/estenrye
