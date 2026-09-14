@@ -118,22 +118,28 @@ do -- in either direction.
 
 ## Status
 
-**Implementation complete for a first pass; not yet run against a real
-cluster with `DRY_RUN=false`.** It builds clean (`cargo check`, `cargo
-clippy -- -D warnings`), has a 17-test suite covering every pure-function
-piece (including a smoke test that gathers+encodes real Prometheus text,
-not just that instrument registration doesn't panic), and the Helm chart
-lints/renders. Verified against the live cluster: `PYTHONPATH` propagation,
-the real container/ConfigMap/Secret names involved, and (via manual,
-`--dry-run`-only reproductions) that patching `neutron-etc`'s
-`ml2_conf.ini` and `neutron-bin`'s `neutron-server.sh` directly is the
-right approach -- the originally-planned `helm upgrade` route turned out to
-be a dead end (Helm can't recover subchart data from its own release
-storage) and was replaced. `extraConfigSecretData` is now fully wired
+**Live-verified end to end against a real `pcd.rye.ninja` cluster with
+`DRY_RUN=false`, 2026-09-14.** A real `unifi-ml2-driver` repair loaded
+successfully, `neutron-server` held `3/3 Running` under real API traffic
+with zero restarts, and the guardian's own post-repair check confirmed
+it via `/metrics` (`ml2_driver_present{driver="unifi"} 1`). Getting
+there surfaced (and fixed) several real bugs along the way -- a
+dependency-shadowing crash, three separate Python-3.11-only symbols an
+upstream driver dependency assumed were available, and an RBAC verb
+mismatch between `kubectl`'s exec transport and this project's
+WebSocket-based one -- each one caught live and recovered via the
+automated `DRY_RUN=true` revert described below, which was exercised
+as a genuine incident-recovery mechanism multiple times, not just
+tested synthetically. See the design doc's "Status" section (the "Fifth
+live attempt" writeup) for the full blow-by-blow.
+
+It builds clean (`cargo check`, `cargo clippy -- -D warnings`), has a
+27-test suite covering every pure-function piece (including a smoke test
+that gathers+encodes real Prometheus text, not just that instrument
+registration doesn't panic), and the Helm chart lints/renders.
+`extraConfigSecretData`/`extraConfigSecretRef` are both fully wired
 (mounted via a `--config-dir` oslo.config scans automatically) and
-`/metrics` returns real Prometheus text format. The one remaining gap: the
-Rust code path itself has never performed a real repair end-to-end -- see
-the design doc's "Status" section for the full detail.
+`/metrics` returns real Prometheus text format.
 
 ## Building and running
 

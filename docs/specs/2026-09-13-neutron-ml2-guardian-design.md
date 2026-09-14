@@ -275,10 +275,14 @@ rather than silently producing a broken `mechanism_drivers` list.
 
 ## Status
 
-This is a first-pass scaffold: it builds cleanly (`cargo check`/`cargo
-clippy -- -D warnings` both pass) and the Helm chart lints/renders, but it
-has **not been run against a real cluster yet** (i.e. it has never actually
-performed a repair).
+**Live-verified end to end as of 2026-09-14** (see the "Fifth live
+attempt" writeup below): a real `unifi-ml2-driver` repair against the
+live `pcd.rye.ninja` cluster loaded successfully, `neutron-server` held
+`3/3 Running` under real API traffic with zero restarts, and the
+guardian's own present-check confirmed it via `/metrics`
+(`ml2_driver_present{driver="unifi"} 1`). It builds cleanly (`cargo
+check`/`cargo clippy -- -D warnings` both pass, 27 unit tests) and the
+Helm chart lints/renders.
 
 **Verified 2026-09-14, against the live cluster or `networking-unifi`'s own
 source:**
@@ -628,6 +632,104 @@ Still true from the second attempt: confirm the post-repair present-check
 and `neutron-server`'s stability once a real repair can be attempted
 safely again -- now the actual next step, with meaningfully higher
 confidence than before.
+
+**Fifth live attempt, 2026-09-14: complete success, after three more
+narrow misses in the same dependency-shadowing family and one RBAC
+bug.** The `orjson`/`python-neutronclient` fix above got past the
+`neutron`/`neutron-lib` shadowing entirely, but the *driver's own*
+dependency `aiohttp-unifi` (the `aiounifi` package) turned out to have a
+different problem: several of its modules assume a newer Python than the
+target image's 3.10. Each crash was fixed and re-attempted in turn:
+- `cannot import name 'Self' from 'typing'` (PEP 673, Python 3.11+).
+- Then `cannot import name 'NotRequired' from 'typing'` (PEP 655,
+  3.11+) -- the *same* unguarded import statement in `firewall_policy.py`/
+  `firewall_zone.py` names both symbols together, so fixing only `Self`
+  wasn't enough; a single import fails whole if any named attribute is
+  missing.
+- Then `cannot import name 'StrEnum' from 'enum'` (3.11+), from
+  `traffic_route.py`.
+
+Rather than keep discovering these one crash at a time, the third one
+prompted a full static scan of every `.py` file in every cached wheel
+(147 wheels) for unconditional imports of any Python 3.11+-only
+typing/enum name -- confirming `aiohttp-unifi` has exactly four unguarded
+call sites total (all now covered) and that every other hit the scan
+found (in `aiohttp`, `multidict`, `yarl`, `setuptools`, `packaging`,
+`cmd2`, `oslo_db`, `dogpile_cache`, `fixtures`, `pyjwt`, `aiosignal`, even
+`typing_extensions` itself) was a false positive from a regex too naive
+to recognize `if sys.version_info` guards and `TYPE_CHECKING` blocks --
+confirmed by hand for a sample (the `typing_extensions` "hit" was
+literally inside its own docstring).
+
+The fix: rather than patch `aiounifi`'s own files (fragile across
+version bumps, and this is a genuine upstream bug in a third-party
+dependency, not something this project should be forking), the injector
+now also writes a `sitecustomize.py` into the installed-plugins
+directory. Python's `site` module auto-imports it at interpreter startup
+for anything importable on `sys.path` -- PYTHONPATH included -- so it
+runs before `neutron-server` loads any mechanism driver, and back-ports
+`typing.Self`/`NotRequired`/`Required` and `enum.StrEnum` onto the real
+stdlib modules from the already-cached `typing_extensions` and
+`backports.strenum` packages, guarded by `sys.version_info`. Deliberately
+general rather than `aiounifi`-specific: any future driver whose own
+dependencies assume a newer Python than the target image provides is
+covered for free, with no per-driver knowledge needed.
+
+One more real bug surfaced along the way, self-inflicted this time: the
+first version of that shim string was built with Rust's
+backslash-newline line-continuation spread across source lines for
+readability, which (correctly, if surprisingly) strips *all* leading
+whitespace from the continued line -- silently eating every line's
+Python indentation and producing `IndentationError: expected an
+indented block after 'if' statement on line 2`. Caught live (one more
+crash-and-revert cycle), fixed by moving the script into its own
+`SITECUSTOMIZE_PY` constant as a single-line string with explicit `\n`
+escapes, and verified from then on by actually rendering the exact
+`install_cmd` output and running it through Python's `compile()` before
+touching the cluster again -- a cheap check that should have been done
+from the start.
+
+With all four `aiounifi` import sites fixed, the repair finally
+succeeded end to end: `unifi` loaded, initialized, and registered as a
+mechanism driver with no errors, `neutron-server` reached and held
+`3/3 Running` with zero restarts, and its logs showed real API traffic
+(`GET /v2.0/security-groups`, `/v2.0/routers`, `/v2.0/subnets`, etc.)
+all returning `200`.
+
+The one remaining gap after that was in the guardian's *own*
+verification, not the repair itself: the post-repair present-check kept
+reporting a false "degraded" via a `403 Forbidden` on every exec
+attempt, including on pods with no rollout in progress at all -- so not
+just the rollout-timing race it first looked like (`find_ready_pod` was
+also fixed to exclude pods with a `deletionTimestamp` set, and the
+post-repair check now retries for up to ~30s, both genuine improvements,
+but neither was the actual cause here). Root-caused by minting a real
+short-lived token for the guardian's own ServiceAccount and curling the
+exec endpoint directly rather than trusting `kubectl auth can-i` or a
+`kubectl exec --as` impersonation test (both said "yes"/appeared to
+work, but neither actually authenticates as the ServiceAccount's own
+bearer token the way the real in-cluster client does): the API server's
+actual error was `cannot get resource "pods/exec"` -- note *get*, not
+*create*. The RBAC convention that `pods/exec` needs the `create` verb
+assumes `kubectl`'s traditional SPDY exec transport, which upgrades via
+an HTTP POST. This controller's `kube-rs` client is built with the `ws`
+cargo feature (the newer WebSocket-based exec transport), which upgrades
+via an HTTP GET instead -- confirmed via `kube-rs`'s own trace-level
+logging -- and Kubernetes maps HTTP GET to the RBAC verb `get`. The
+chart's Role granted only `create`, so it denied every single exec
+request from this specific client, consistently, not intermittently.
+Fixed by granting both verbs. After that fix, `/metrics` showed
+`ml2_driver_present{driver="unifi"} 1` with no further errors, and
+`neutron-server` remained untouched and stable throughout (a genuine
+present-check running against an already-healthy driver never
+triggers a repair).
+
+**Current status: fully successful, live-verified.** The driver loads,
+the workload it patches stays healthy under real traffic, the guardian's
+own health signal agrees, and the automated `DRY_RUN=true` revert path
+was exercised as the real recovery mechanism multiple times during this
+same process -- not a synthetic test, the actual safety net working
+under actual pressure, every time it was needed.
 
 ## Automated revert: `DRY_RUN=true` now means "zero footprint," not just "don't touch anything"
 
