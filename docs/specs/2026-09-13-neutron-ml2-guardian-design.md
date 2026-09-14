@@ -275,14 +275,21 @@ rather than silently producing a broken `mechanism_drivers` list.
 
 ## Status
 
-**Live-verified end to end as of 2026-09-14** (see the "Fifth live
-attempt" writeup below): a real `unifi-ml2-driver` repair against the
-live `pcd.rye.ninja` cluster loaded successfully, `neutron-server` held
-`3/3 Running` under real API traffic with zero restarts, and the
-guardian's own present-check confirmed it via `/metrics`
-(`ml2_driver_present{driver="unifi"} 1`). It builds cleanly (`cargo
-check`/`cargo clippy -- -D warnings` both pass, 27 unit tests) and the
-Helm chart lints/renders.
+**The guardian mechanism itself is live-verified as of 2026-09-14; the
+`unifi-ml2-driver` it was tested against is not yet actually working.**
+A real repair loaded the driver successfully, `neutron-server` held
+`3/3 Running` under real GET-heavy API traffic with zero restarts, and
+the guardian's own present-check confirmed it via `/metrics`
+(`ml2_driver_present{driver="unifi"} 1`) -- all real, all still true. But
+the very first real `openstack network create` against that driver
+failed outright, with a genuine bug in the upstream package (see the
+"Fifth live attempt" writeup's correction, below) that none of this
+project's checks had exercised. The guardian's own job -- detect drift,
+inject a driver, keep it installed, revert cleanly on command -- is
+proven. Whether `unifi-ml2-driver` is a working driver once injected is
+a separate, still-open question. It builds cleanly (`cargo check`/`cargo
+clippy -- -D warnings` both pass, 27 unit tests) and the Helm chart
+lints/renders.
 
 **Verified 2026-09-14, against the live cluster or `networking-unifi`'s own
 source:**
@@ -724,12 +731,70 @@ Fixed by granting both verbs. After that fix, `/metrics` showed
 present-check running against an already-healthy driver never
 triggers a repair).
 
-**Current status: fully successful, live-verified.** The driver loads,
-the workload it patches stays healthy under real traffic, the guardian's
-own health signal agrees, and the automated `DRY_RUN=true` revert path
-was exercised as the real recovery mechanism multiple times during this
-same process -- not a synthetic test, the actual safety net working
-under actual pressure, every time it was needed.
+**Correction, later the same day: "fully successful" above was premature.**
+Everything in it is true as far as it goes -- the driver loads, `neutron-
+server` stays healthy, the guardian's own present-check agrees -- but
+none of that actually exercises the mechanism driver's real job. `unifi`
+only *does* anything on `create_network_postcommit`/`update_.../delete_...`
+-- i.e. an actual `openstack network create`. Every check this project
+had run up to this point (health, `/metrics`, GET-only API traffic) never
+triggered that code path even once. The very next real network create
+(a `tofu apply` for an unrelated VLAN network, from a different, ongoing
+piece of work against this same cluster) did, and it failed immediately:
+
+```
+oslo_config.cfg.NoSuchOptError: no such option controller in group [unifi]
+```
+
+Root cause, found by pulling `unifi_ml2_driver`'s actual wheel content out
+of the cache and reading it directly: `unifi_mech.py`'s `_get_controller()`
+checks `if CONF.unifi.controller not in self._controllers` before every
+single controller-API call, but `config.py` never registers a `controller`
+option in the `[unifi]` group at all -- only `host`, `port`, `apikey`,
+`username`, `password`, `site`, `verify_ssl`, `cafile`, and assorted
+feature flags. This isn't a config mistake on this project's side; it's a
+genuine bug in the published package -- confirmed still present in the
+latest release on PyPI (1.0.9) by downloading and reading it directly,
+not just the 1.0.5 this cluster's wheel cache happened to resolve. Every
+call to `_get_controller()` -- which is to say, every real network
+create/update/delete -- raises unconditionally. `create_network_postcommit`
+isn't wrapped in the same broad try/except that `initialize()` uses (which
+is why *that* call succeeds silently at startup and never surfaces this);
+Neutron's own ML2 manager catches the resulting `MechanismDriverError` and
+rolls back by deleting the network it just created -- which is exactly
+what happened to the unrelated `tofu apply`'s `vlan1000-net`, and why it
+came back as a hard failure rather than the driver just quietly not
+syncing anything.
+
+A second, independent gap surfaced by the same investigation: 1.0.5 (what
+was actually running) doesn't support API-key auth at all --
+`get_unifi_api()` only passes `username`/`password` to `aiounifi`'s
+`Configuration`, and `config.py` has no `apikey` option, despite this
+project's whole config schema (`extraConfigSecretData`/`extraConfigSecretRef`,
+`host`/`apikey`/`site`) being built around the newer key-based API this
+repo's original investigation found documented. 1.0.9 does add a real
+`apikey` StrOpt and does pass it through to `Configuration` -- so this
+part is fixed upstream, just not in the version the wheel cache had
+resolved. `_sync_networks()` remains a documented no-op stub in both
+versions ("Implementation would require access to the Neutron DB...
+Skipped for this example") -- not exercised by this bug, but a sign this
+package may be closer to a reference implementation than a
+production-hardened driver.
+
+**Immediate response**: reverted via the same `DRY_RUN=true` mechanism as
+every other incident this project has hit -- `neutron-server` was back to
+serving normal network CRUD within seconds, unblocking the VLAN work this
+bug had broken. **Not yet done**: a real fix (most likely, following this
+project's own established pattern, a `sitecustomize.py` addition that
+registers the missing `controller` oslo_config option with some harmless
+default -- the value doesn't matter functionally, since `self._controllers`
+is actually keyed by `CONF.unifi.host`, not `CONF.unifi.controller`, so
+this really is just a dead/leftover conditional) combined with pinning the
+wheel cache to `unifi-ml2-driver>=1.0.6` for real `apikey` support, then --
+critically -- actually exercising a real `openstack network create`
+end-to-end before calling this driver working again. Every previous
+"success" in this doc was real for what it tested, but what it tested
+turned out not to include the one thing that matters.
 
 ## Automated revert: `DRY_RUN=true` now means "zero footprint," not just "don't touch anything"
 

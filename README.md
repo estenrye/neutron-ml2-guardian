@@ -118,20 +118,27 @@ do -- in either direction.
 
 ## Status
 
-**Live-verified end to end against a real `pcd.rye.ninja` cluster with
-`DRY_RUN=false`, 2026-09-14.** A real `unifi-ml2-driver` repair loaded
-successfully, `neutron-server` held `3/3 Running` under real API traffic
-with zero restarts, and the guardian's own post-repair check confirmed
-it via `/metrics` (`ml2_driver_present{driver="unifi"} 1`). Getting
-there surfaced (and fixed) several real bugs along the way -- a
+**The guardian's own repair/detect/revert mechanism is live-verified
+end to end against a real `pcd.rye.ninja` cluster with `DRY_RUN=false`,
+2026-09-14 -- the `unifi-ml2-driver` it was tested against is not yet
+actually working, though.** A real repair loaded the driver
+successfully, `neutron-server` held `3/3 Running` with zero restarts,
+and the guardian's own post-repair check confirmed it via `/metrics`
+(`ml2_driver_present{driver="unifi"} 1`) -- but that traffic was all
+GET requests, and the driver only does anything on a real `openstack
+network create`. The first one of those against this driver failed
+outright with a genuine bug in the upstream package (see the design
+doc's "Fifth live attempt" correction). Getting to that point surfaced
+(and fixed) several other real bugs along the way -- a
 dependency-shadowing crash, three separate Python-3.11-only symbols an
 upstream driver dependency assumed were available, and an RBAC verb
 mismatch between `kubectl`'s exec transport and this project's
 WebSocket-based one -- each one caught live and recovered via the
-automated `DRY_RUN=true` revert described below, which was exercised
-as a genuine incident-recovery mechanism multiple times, not just
-tested synthetically. See the design doc's "Status" section (the "Fifth
-live attempt" writeup) for the full blow-by-blow.
+automated `DRY_RUN=true` revert described below, which has now been
+exercised as a genuine incident-recovery mechanism (including for the
+still-open driver bug above) several times, not just tested
+synthetically. See the design doc's "Status" section for the full
+blow-by-blow.
 
 It builds clean (`cargo check`, `cargo clippy -- -D warnings`), has a
 27-test suite covering every pure-function piece (including a smoke test
