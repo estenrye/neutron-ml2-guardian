@@ -73,8 +73,19 @@ pub async fn refresh(
     // `ls -1` after the download is what the guardian reads back from this
     // Job's pod logs to learn what got downloaded -- see module doc comment
     // for why this replaces a direct filesystem read.
+    //
+    // `--ignore-requires-python`: found live, 2026-09-14 -- some drivers'
+    // own dependencies declare a `Requires-Python` stricter than what
+    // their code actually needs (confirmed for `aiohttp-unifi>=86`, which
+    // declares `>=3.12.0` but genuinely runs on 3.10 once the handful of
+    // missing `typing`/`enum` symbols it uses are back-ported; see
+    // `k8s::SITECUSTOMIZE_PY`). Without this flag `pip download` silently
+    // discards every version past the last one that happened to declare a
+    // compatible constraint, which is why this project's wheel cache kept
+    // resolving a stale `unifi-ml2-driver==1.0.5` instead of a newer,
+    // already-fixed release.
     let script = format!(
-        "set -eu; mkdir -p {dest}; pip download --no-cache-dir --dest {dest} {}; ls -1 {dest}",
+        "set -eu; mkdir -p {dest}; pip download --no-cache-dir --ignore-requires-python --dest {dest} {}; ls -1 {dest}",
         driver.pip_package
     );
 

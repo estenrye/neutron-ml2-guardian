@@ -83,7 +83,12 @@ ml2Drivers: []
 # Network Integration API -- GET /proxy/network/integration/v1/sites
 # returned HTTP 200 with one site, internalReference "default" -- from both
 # the PCD host and from inside a pod's own network namespace in this
-# cluster, 2026-09-14):
+# cluster, 2026-09-14). pipPackage is unifi-ml2-driver-estenrye, not
+# upstream's unifi-ml2-driver -- same import name and entry point (drop-in
+# otherwise), but fixes a real crash-on-every-network-create bug and
+# relaxes requires-python to what the code actually needs; see
+# github.com/estenrye/networking-unifi and this doc's design spec's
+# "Fifth live attempt" correction for the full story.
 #
 #   kubectl create secret generic neutron-ml2-unifi-external-config \
 #     -n pcd --from-literal=unifi.ini="$(cat <<EOF
@@ -96,14 +101,14 @@ ml2Drivers: []
 #
 # ml2Drivers:
 #   - name: unifi
-#     pipPackage: unifi-ml2-driver
+#     pipPackage: unifi-ml2-driver-estenrye
 #     importModule: unifi_ml2_driver
 #     extraConfigSecretRef: neutron-ml2-unifi-external-config
 #
 # Or inline (only for config with no real credentials):
 # ml2Drivers:
 #   - name: unifi
-#     pipPackage: unifi-ml2-driver
+#     pipPackage: unifi-ml2-driver-estenrye
 #     importModule: unifi_ml2_driver
 #     extraConfigSecretData: |
 #       [unifi]

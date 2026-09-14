@@ -442,11 +442,16 @@ impl K8s {
         // above (the package itself must be installed -- it's the driver's
         // own transitive dependency, not something already present in the
         // base image). See `SITECUSTOMIZE_PY`'s doc comment for the fix.
+        // `--ignore-requires-python`: matches the wheel-cache Job's own
+        // `pip download` (see `wheelcache::refresh`'s doc comment) --
+        // installing here has to bypass the same over-strict declared
+        // constraints the download step already had to bypass to fetch
+        // these wheels in the first place.
         let install_cmd = format!(
             "mkdir -p {PLUGIN_MOUNT_PATH} && \
              find {WHEELCACHE_MOUNT_PATH} -mindepth 2 -maxdepth 2 -name '*.whl' \
              | grep -Eiv '/({})-[0-9]' \
-             | xargs -r pip install --no-index --no-deps --target={PLUGIN_MOUNT_PATH} && \
+             | xargs -r pip install --no-index --no-deps --ignore-requires-python --target={PLUGIN_MOUNT_PATH} && \
              cat > {PLUGIN_MOUNT_PATH}/sitecustomize.py <<'PYEOF'\n{SITECUSTOMIZE_PY}PYEOF",
             ASSUMED_PRESENT_PACKAGES.join("|"),
         );

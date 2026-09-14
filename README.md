@@ -50,9 +50,12 @@ helmReleaseName: neutron      # Helm release to guard
 deploymentName: neutron-server
 
 ml2Drivers:
-  - name: unifi                        # the mechanism_drivers/stevedore name
-    pipPackage: unifi-ml2-driver       # pip-installable package
-    importModule: unifi_ml2_driver     # top-level module to test-import
+  - name: unifi                              # the mechanism_drivers/stevedore name
+    pipPackage: unifi-ml2-driver-estenrye    # pip-installable package -- github.com/estenrye/networking-unifi,
+                                              # a fork fixing a real crash-on-every-network-create bug and a
+                                              # requires-python constraint tighter than the code actually needs
+                                              # (see the design doc); same import name/entry point as upstream
+    importModule: unifi_ml2_driver           # top-level module to test-import
     extraConfigSecretData: |           # opaque -- never parsed by the guardian
       [unifi]
       host = 10.45.0.1                 # real, verified reachable UDM-SE address for this cluster
