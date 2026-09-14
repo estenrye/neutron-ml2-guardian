@@ -344,7 +344,7 @@ async fn describe_intended_repair(
     let new_ml2_conf = add_driver_to_ml2_conf(&current_ml2_conf, &driver.name)?;
     let changed = new_ml2_conf != current_ml2_conf;
 
-    let has_extra_config = !driver.extra_config_secret_data.is_empty();
+    let has_extra_config = driver.has_extra_config();
     Ok(format!(
         "patch secret {NEUTRON_ETC_SECRET_NAME}/{ML2_CONF_SECRET_KEY} (mechanism_drivers change: {changed}); \
          has extra config: {has_extra_config}{}; \
@@ -391,7 +391,7 @@ async fn repair(
     //    EXTRA_CONF_DIR at all (a one-time change per script -- see
     //    add_config_dir_flag; harmless/idempotent to re-check every time a
     //    driver with extra config repairs).
-    if !driver.extra_config_secret_data.is_empty() {
+    if driver.has_extra_config() {
         let current_script = k8s
             .get_configmap_key(NEUTRON_BIN_CONFIGMAP_NAME, NEUTRON_SERVER_SCRIPT_KEY)
             .await?;

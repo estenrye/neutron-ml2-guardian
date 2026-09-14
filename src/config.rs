@@ -43,13 +43,34 @@ pub struct DriverSpec {
 
     /// Opaque INI content this driver needs in its own Neutron config
     /// section(s) (e.g. a `[unifi]` block with a controller URL/API key, or
-    /// a `[genericswitch:leaf1]` block). Never parsed or validated by the
-    /// guardian -- written verbatim into a per-driver Secret and mounted as
-    /// an extra `--config-file` on `neutron-server`. May be empty for a
+    /// a `[genericswitch:leaf1]` block), inlined directly into this repo's
+    /// Helm values. Never parsed or validated by the guardian -- written
+    /// verbatim into a per-driver Secret this chart manages
+    /// (`neutron-ml2-<name>-config`) and mounted as an extra `--config-file`
+    /// on `neutron-server`. Mutually exclusive with
+    /// `extra_config_secret_ref` -- see that field's doc comment for when
+    /// to prefer it instead. May be left empty (with no ref either) for a
     /// driver that needs no extra config beyond being listed in
     /// `mechanism_drivers`.
     #[serde(default)]
     pub extra_config_secret_data: String,
+
+    /// Name of an **existing** Secret (in the target namespace, created
+    /// out-of-band -- `kubectl create secret`, an external-secrets
+    /// operator, etc., never by this chart's own values) holding this
+    /// driver's extra config. Preferred over `extra_config_secret_data`
+    /// whenever the config contains real credentials: unlike inline data,
+    /// nothing here ever passes through this chart's Helm values or release
+    /// storage, since the guardian only ever references the secret by name
+    /// -- it never reads or writes its contents. Mutually exclusive with
+    /// `extra_config_secret_data` (the guardian refuses to start if both
+    /// are set for the same driver). The referenced Secret must contain a
+    /// key named `<name>.ini` -- the same convention
+    /// `extra_config_secret_data` uses internally -- so the mount logic in
+    /// `k8s::apply_injection_patch` doesn't need to care which path
+    /// produced the Secret it's mounting.
+    #[serde(default)]
+    pub extra_config_secret_ref: Option<String>,
 
     /// Set for a driver that is *not* designed to coexist with other
     /// `sole_driver`-flagged entries (most physical-switch/add-on ML2
@@ -59,6 +80,33 @@ pub struct DriverSpec {
     /// silently producing a `mechanism_drivers` list neither expects.
     #[serde(default)]
     pub sole_driver: bool,
+}
+
+impl DriverSpec {
+    /// True if this driver needs anything mounted into `EXTRA_CONF_DIR` at
+    /// all -- either form counts.
+    pub fn has_extra_config(&self) -> bool {
+        !self.extra_config_secret_data.is_empty() || self.extra_config_secret_ref.is_some()
+    }
+
+    /// The Secret name the guardian itself would create/manage for this
+    /// driver's *inline* `extra_config_secret_data` -- the single source of
+    /// truth for that naming convention. Used only by
+    /// `k8s::write_driver_config_secret`, which must never write to this
+    /// name when `extra_config_secret_ref` is set instead (that Secret is
+    /// externally managed; the guardian must never touch its contents).
+    pub fn managed_secret_name(&self) -> String {
+        format!("neutron-ml2-{}-config", self.name)
+    }
+
+    /// The Secret name `k8s::apply_injection_patch` should actually mount
+    /// for this driver's extra config: `extra_config_secret_ref` if set,
+    /// otherwise `managed_secret_name()`.
+    pub fn extra_config_secret_name(&self) -> String {
+        self.extra_config_secret_ref
+            .clone()
+            .unwrap_or_else(|| self.managed_secret_name())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -143,6 +191,7 @@ impl Config {
         }
 
         validate_sole_drivers(&drivers)?;
+        validate_extra_config_exclusive(&drivers)?;
 
         Ok(Config {
             listen_addr,
@@ -186,6 +235,24 @@ fn validate_sole_drivers(drivers: &[DriverSpec]) -> anyhow::Result<()> {
         anyhow::bail!(
             "more than one driver is flagged sole_driver ({:?}) -- these can't be combined, fix the drivers config",
             sole_drivers
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a driver that sets both `extra_config_secret_data` and
+/// `extra_config_secret_ref` -- ambiguous which one should actually be
+/// mounted, so this fails loudly rather than picking one silently.
+fn validate_extra_config_exclusive(drivers: &[DriverSpec]) -> anyhow::Result<()> {
+    let conflicting: Vec<&str> = drivers
+        .iter()
+        .filter(|d| !d.extra_config_secret_data.is_empty() && d.extra_config_secret_ref.is_some())
+        .map(|d| d.name.as_str())
+        .collect();
+    if !conflicting.is_empty() {
+        anyhow::bail!(
+            "driver(s) {:?} set both extraConfigSecretData and extraConfigSecretRef -- these are mutually exclusive, pick one",
+            conflicting
         );
     }
     Ok(())
@@ -238,6 +305,7 @@ ml2Drivers:
             pip_package: "a".into(),
             import_module: "a".into(),
             extra_config_secret_data: String::new(),
+            extra_config_secret_ref: None,
             sole_driver: true,
         }];
         assert!(validate_sole_drivers(&one).is_ok());
@@ -251,6 +319,7 @@ ml2Drivers:
                 pip_package: "a".into(),
                 import_module: "a".into(),
                 extra_config_secret_data: String::new(),
+                extra_config_secret_ref: None,
                 sole_driver: true,
             },
             DriverSpec {
@@ -258,9 +327,52 @@ ml2Drivers:
                 pip_package: "b".into(),
                 import_module: "b".into(),
                 extra_config_secret_data: String::new(),
+                extra_config_secret_ref: None,
                 sole_driver: true,
             },
         ];
         assert!(validate_sole_drivers(&two).is_err());
+    }
+
+    fn driver_with(data: &str, secret_ref: Option<&str>) -> DriverSpec {
+        DriverSpec {
+            name: "unifi".into(),
+            pip_package: "unifi-ml2-driver".into(),
+            import_module: "unifi_ml2_driver".into(),
+            extra_config_secret_data: data.to_string(),
+            extra_config_secret_ref: secret_ref.map(String::from),
+            sole_driver: false,
+        }
+    }
+
+    #[test]
+    fn has_extra_config_true_for_either_form() {
+        assert!(!driver_with("", None).has_extra_config());
+        assert!(driver_with("[unifi]", None).has_extra_config());
+        assert!(driver_with("", Some("external-secret")).has_extra_config());
+    }
+
+    #[test]
+    fn extra_config_secret_name_prefers_ref() {
+        assert_eq!(
+            driver_with("[unifi]", None).extra_config_secret_name(),
+            "neutron-ml2-unifi-config"
+        );
+        assert_eq!(
+            driver_with("", Some("my-external-secret")).extra_config_secret_name(),
+            "my-external-secret"
+        );
+    }
+
+    #[test]
+    fn validate_extra_config_exclusive_allows_either_alone() {
+        assert!(validate_extra_config_exclusive(&[driver_with("[unifi]", None)]).is_ok());
+        assert!(validate_extra_config_exclusive(&[driver_with("", Some("ext"))]).is_ok());
+        assert!(validate_extra_config_exclusive(&[driver_with("", None)]).is_ok());
+    }
+
+    #[test]
+    fn validate_extra_config_exclusive_rejects_both() {
+        assert!(validate_extra_config_exclusive(&[driver_with("[unifi]", Some("ext"))]).is_err());
     }
 }

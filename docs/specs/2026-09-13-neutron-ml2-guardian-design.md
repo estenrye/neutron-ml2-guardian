@@ -232,6 +232,24 @@ stacking multiple `--config-file` arguments (the same mechanism
 `ml2_conf.ini` itself relies on), so this composes without the guardian
 needing any driver-specific logic.
 
+**`extraConfigSecretRef`, added 2026-09-14, is the credential-safe
+alternative to the above.** `extraConfigSecretData` puts real credentials
+(a controller API key, switch passwords) inline in this chart's own Helm
+values -- fine for config with nothing sensitive in it, but every real
+deployment so far has needed actual credentials. `extraConfigSecretRef`
+takes the name of an **existing** Secret instead (created out-of-band --
+`kubectl create secret`, an external-secrets operator, whatever the
+deployer already uses) that the guardian only ever references by name in
+its mount (`k8s::apply_injection_patch`) -- it never reads or writes that
+Secret's contents at all, so nothing sensitive passes through this chart's
+values or release storage. The two are mutually exclusive per driver
+(`config::validate_extra_config_exclusive` refuses to start otherwise);
+the referenced Secret must contain a key named `<driver name>.ini`, the
+same convention the guardian's own managed Secrets use
+(`DriverSpec::extra_config_secret_name`/`managed_secret_name`), so
+`apply_injection_patch`'s mount logic doesn't need to care which path
+produced the Secret it's mounting.
+
 `soleDriver` (optional, default `false`) exists for the uncommon case of a
 driver that isn't designed to coexist additively alongside
 `openvswitch`/`ovn` and other add-on drivers -- the guardian refuses to

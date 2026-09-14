@@ -38,16 +38,11 @@ const WHEELCACHE_MOUNT_PATH: &str = "/wheelcache";
 
 /// Directory oslo.config scans for extra `*.conf` files, once `--config-dir`
 /// is added to `neutron-server.sh` (see `reconcile::add_config_dir_flag`).
-/// Each driver with non-empty `extraConfigSecretData` gets its own file
-/// mounted here by `apply_injection_patch`.
+/// Each driver with `has_extra_config()` true gets its own file mounted
+/// here by `apply_injection_patch`, sourced from
+/// `DriverSpec::extra_config_secret_name()` -- either the guardian-managed
+/// Secret or a user-provided `extraConfigSecretRef`.
 pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
-
-/// Name of the per-driver extra-config Secret `write_driver_config_secret`
-/// creates and `apply_injection_patch` mounts -- factored out so the two
-/// can't drift out of sync with each other.
-fn driver_config_secret_name(driver_name: &str) -> String {
-    format!("neutron-ml2-{driver_name}-config")
-}
 
 pub struct K8s {
     client: Client,
@@ -263,14 +258,11 @@ impl K8s {
         // *mounted* filename, not the Secret's internal key name.
         let mut extra_config_volumes = Vec::new();
         let mut extra_config_mounts = Vec::new();
-        for driver in drivers
-            .iter()
-            .filter(|d| !d.extra_config_secret_data.is_empty())
-        {
+        for driver in drivers.iter().filter(|d| d.has_extra_config()) {
             let volume_name = format!("ml2-extra-config-{}", driver.name);
             extra_config_volumes.push(json!({
                 "name": volume_name,
-                "secret": { "secretName": driver_config_secret_name(&driver.name) },
+                "secret": { "secretName": driver.extra_config_secret_name() },
             }));
             extra_config_mounts.push(json!({
                 "name": volume_name,
@@ -431,13 +423,16 @@ impl K8s {
         Ok(())
     }
 
-    /// Writes (or updates) the per-driver extra-config Secret. Content is
-    /// opaque to the guardian -- see `DriverSpec::extra_config_secret_data`.
+    /// Writes (or updates) the per-driver extra-config Secret from
+    /// `DriverSpec::extra_config_secret_data`. A no-op if that's empty, or
+    /// if `extra_config_secret_ref` is set instead -- that Secret is
+    /// externally managed, and this method must never write to it (see
+    /// that field's doc comment).
     pub async fn write_driver_config_secret(&self, driver: &DriverSpec) -> GuardianResult<()> {
-        if driver.extra_config_secret_data.is_empty() {
+        if driver.extra_config_secret_data.is_empty() || driver.extra_config_secret_ref.is_some() {
             return Ok(());
         }
-        let name = driver_config_secret_name(&driver.name);
+        let name = driver.managed_secret_name();
         let mut data = BTreeMap::new();
         data.insert(
             format!("{}.ini", driver.name),

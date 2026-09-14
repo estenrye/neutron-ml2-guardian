@@ -52,9 +52,22 @@ wheelcache:
 #   pipPackage:                  pip-installable package spec
 #   importModule:                top-level Python module to test-import
 #   extraConfigSecretData:       (optional) opaque INI content this driver
-#                                needs, written verbatim into a per-driver
-#                                Secret and mounted as an extra
-#                                --config-file. Never parsed by the guardian.
+#                                needs, inlined here and written verbatim by
+#                                the guardian into its own managed
+#                                per-driver Secret. Never parsed by the
+#                                guardian. Mutually exclusive with
+#                                extraConfigSecretRef.
+#   extraConfigSecretRef:        (optional) name of an *existing* Secret
+#                                (created out-of-band, e.g. `kubectl create
+#                                secret generic <name> --from-literal=
+#                                <driver-name>.ini=...`) the guardian only
+#                                references and mounts -- never reads or
+#                                writes its contents. Prefer this over
+#                                extraConfigSecretData whenever the config
+#                                contains real credentials, since nothing
+#                                sensitive then passes through this chart's
+#                                values or release storage at all. Mutually
+#                                exclusive with extraConfigSecretData.
 #   soleDriver:                  (optional, default false) set only for a
 #                                driver that cannot coexist with other
 #                                soleDriver-flagged entries.
@@ -63,15 +76,31 @@ wheelcache:
 # section. Empty by default -- a real deployment of this chart must set at
 # least one driver via its own values file/overlay.
 ml2Drivers: []
-# Example, using networking-unifi's real [unifi] config schema (verified
-# 2026-09-14 against unifi_ml2_driver/config.py -- apikey is preferred over
-# username/password when both are set). host/site below are the real,
-# verified values for pcd.rye.ninja's UDM-SE (confirmed reachable and
-# authenticating via its Network Integration API -- GET
-# /proxy/network/integration/v1/sites returned HTTP 200 with one site,
-# internalReference "default" -- from both the PCD host and from inside a
-# pod's own network namespace in this cluster, 2026-09-14). apikey is never
-# a real value here -- see values.secrets.yaml convention in .gitignore.
+# Example using extraConfigSecretRef (recommended, since this holds a real
+# API key) against networking-unifi's real [unifi] config schema (verified
+# 2026-09-14 against unifi_ml2_driver/config.py) and pcd.rye.ninja's real,
+# verified UDM-SE address (confirmed reachable and authenticating via its
+# Network Integration API -- GET /proxy/network/integration/v1/sites
+# returned HTTP 200 with one site, internalReference "default" -- from both
+# the PCD host and from inside a pod's own network namespace in this
+# cluster, 2026-09-14):
+#
+#   kubectl create secret generic neutron-ml2-unifi-external-config \
+#     -n pcd --from-literal=unifi.ini="$(cat <<EOF
+#   [unifi]
+#   host = 10.45.0.1
+#   apikey = <the real key>
+#   site = default
+#   EOF
+#   )"
+#
+# ml2Drivers:
+#   - name: unifi
+#     pipPackage: unifi-ml2-driver
+#     importModule: unifi_ml2_driver
+#     extraConfigSecretRef: neutron-ml2-unifi-external-config
+#
+# Or inline (only for config with no real credentials):
 # ml2Drivers:
 #   - name: unifi
 #     pipPackage: unifi-ml2-driver
