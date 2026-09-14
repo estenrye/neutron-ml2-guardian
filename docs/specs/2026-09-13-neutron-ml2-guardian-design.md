@@ -421,14 +421,43 @@ patches started hitting the real API server:
   patches against `neutron-etc`/`neutron-bin` (those are read fresh every
   reconcile tick).
 
-Next: re-deploy with the `.force()` fix and confirm a full real repair
-succeeds end-to-end, including the post-repair present-check.
+**Second live attempt, same day, after the `.force()` fix: progress, then a
+second real bug, also safely contained.** Re-deployed (pinning the
+Deployment to the exact new image digest to sidestep a `main`-tag caching
+question, not a guardian bug -- worth remembering as its own deployment
+gotcha: a moving tag plus `IfNotPresent` can silently keep running a stale
+image after a fix ships). This run got further:
+- `mechanism_drivers` patch and the `neutron-bin` `--config-dir` patch both
+  succeeded this time -- `.force()` fixed exactly what it was meant to.
+- **The wheel-cache download Job succeeded against the real `pf9-neutron`
+  image** -- confirms `pip` is available and has outbound PyPI access
+  there, closing that open question. Classified as `VersionPinned`
+  (`unifi-ml2-driver`'s dependency closure has at least one
+  platform/ABI-specific wheel), confirming the per-image-version refresh
+  design (not the simpler "safe forever" pure-Python case) is the one that
+  actually matters here.
+- **New failure**: `apply_injection_patch`'s `Deployment` patch -- a 400
+  `"invalid object type: /, Kind="`. Root cause: that patch is built as a
+  raw `serde_json::Value` (`json!({"spec": {...}})`), with no
+  `apiVersion`/`kind`/`metadata.name`. The other three patch methods in
+  this file (`patch_secret_key`, `patch_configmap_key`,
+  `write_driver_config_secret`) never hit this because they serialize
+  actual typed `Secret`/`ConfigMap` structs, which carry these fields for
+  free -- server-side apply requires a `Patch::Apply` body to self-identify
+  its type, and a bare partial `Value` doesn't. Fixed by adding
+  `apiVersion`/`kind`/`metadata` explicitly to that one `json!` call.
+- **Safety property held again**: this failure was caught *after* the
+  wheel cache was already refreshed but *before* the Deployment patch (the
+  step that actually triggers a rollout) took effect. `neutron-server` was
+  confirmed unaffected throughout both failed attempts -- same pod, same
+  age, `3/3 Running`, the entire time.
+
+Next: re-deploy with this fix and confirm a full real repair succeeds
+end-to-end, including the post-repair present-check.
 
 **Still open:**
-- Confirm the wheel-cache download Job actually succeeds against the real
-  `pf9-neutron` image (untested until a repair reaches that step) --
-  specifically, whether `pip` is available in that image and whether it
-  has outbound PyPI access.
 - Confirm the post-repair present-check (`mechanism_drivers` line +
   `python3 -c "import unifi_ml2_driver"`) actually passes once the
   initContainer has had a chance to run.
+- Confirm `neutron-server` itself comes back `Ready` and stable after the
+  injection patch finally triggers its first real rollout.

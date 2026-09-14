@@ -298,7 +298,22 @@ impl K8s {
         })];
         main_container_mounts.extend(extra_config_mounts);
 
+        // apiVersion/kind/metadata.name are required here, not decorative:
+        // unlike the typed Secret/ConfigMap structs the other patch methods
+        // in this file use (which get these fields for free from their own
+        // Serialize impls), this is a raw serde_json::Value, and Kubernetes
+        // server-side apply rejects a Patch::Apply body that doesn't
+        // self-identify its type -- confirmed live: omitting them produces
+        // "invalid object type: /, Kind=" (400 BadRequest), not a clearer
+        // "apiVersion required" message, which is why this is called out
+        // explicitly rather than left to look like normal patch scaffolding.
         let patch = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": deployment_name,
+                "namespace": self.namespace,
+            },
             "spec": {
                 "template": {
                     "metadata": {
