@@ -61,10 +61,20 @@ pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 /// Back-ports Python 3.11+ stdlib additions onto an older interpreter:
 /// `typing.Self` (PEP 673), `typing.NotRequired`/`Required` (PEP 655) from
 /// the `typing_extensions` backport, and `enum.StrEnum` from the
-/// `backports.strenum` backport -- both already assumed present in the
-/// target image (see `ASSUMED_PRESENT_PACKAGES`). All three found the same
-/// way: a real repair against `unifi-ml2-driver`'s `aiohttp-unifi`
-/// dependency crashed three times in a row, once per missing symbol,
+/// `backports.strenum` backport. `typing_extensions` is genuinely already
+/// present in the target image (a near-universal transitive dependency of
+/// the OpenStack/oslo stack, see `ASSUMED_PRESENT_PACKAGES`), but
+/// `backports.strenum` is not -- and, confirmed live, 2026-09-14, can't be
+/// relied on to arrive as a transitive dependency either:
+/// `aiohttp-unifi`'s own published metadata declares only `aiohttp`,
+/// `orjson`, and `segno` as dependencies, despite its code needing both
+/// backports on <3.11 -- a real gap in that package's own packaging, not
+/// something this project's dependency resolution can discover. See
+/// `SITECUSTOMIZE_SUPPORT_PACKAGES`, which `wheelcache::refresh` fetches
+/// unconditionally alongside whatever the configured driver needs, exactly
+/// to cover this. All three symbols found the same way: a real repair
+/// against `unifi-ml2-driver`'s `aiohttp-unifi` dependency crashed three
+/// times in a row, once per missing symbol,
 /// because most of that package's modules guard these imports with a
 /// `try`/`except ImportError` fallback but four specific files don't --
 /// confirmed by statically scanning every module in every cached wheel for
@@ -82,6 +92,22 @@ pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 /// an `IndentationError` -- confirmed live, see the design doc's incident
 /// writeup.
 const SITECUSTOMIZE_PY: &str = "import sys\nif sys.version_info < (3, 11):\n    import typing\n    import typing_extensions\n    for _name in (\"Self\", \"NotRequired\", \"Required\"):\n        if not hasattr(typing, _name):\n            setattr(typing, _name, getattr(typing_extensions, _name))\n    import enum\n    if not hasattr(enum, \"StrEnum\"):\n        from backports.strenum import StrEnum\n        enum.StrEnum = StrEnum\n";
+
+/// Packages `SITECUSTOMIZE_PY` itself needs at runtime (`backports.strenum`
+/// specifically), fetched unconditionally by `wheelcache::refresh`
+/// alongside whatever a driver's own `pip_package` resolves to. Confirmed
+/// live, 2026-09-14, that this can't just be left to normal dependency
+/// resolution: `aiohttp-unifi`'s own published metadata never declares
+/// `backports.strenum` (or `typing_extensions`) as a dependency at all,
+/// despite its code needing the former on Python <3.11 -- a real gap in
+/// that package's own packaging. `typing_extensions` is deliberately not
+/// listed here even though the shim imports it too: it's already assumed
+/// present in the target image (see `ASSUMED_PRESENT_PACKAGES`) as a
+/// near-universal transitive dependency of the OpenStack/oslo stack, and
+/// fetching it fresh would risk shadowing that already-compatible copy for
+/// no benefit -- exactly the failure mode `ASSUMED_PRESENT_PACKAGES`
+/// exists to avoid.
+pub const SITECUSTOMIZE_SUPPORT_PACKAGES: &[&str] = &["backports.strenum"];
 
 /// Package distribution names (wheel-filename form: non-alphanumeric runs
 /// become `_`, matched case-insensitively since wheel filenames preserve

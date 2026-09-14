@@ -95,8 +95,18 @@ pub async fn refresh(
     // A clean directory every refresh is what actually matches this
     // cache's job: reflect the current resolution, not every historical
     // one.
+    //
+    // `SITECUSTOMIZE_SUPPORT_PACKAGES` fetched alongside the driver's own
+    // package, not left to transitive resolution -- found live, 2026-09-14,
+    // that this genuinely can't be left to chance: `aiohttp-unifi` needs
+    // `backports.strenum` at runtime but never declares it as a dependency,
+    // so ordinary resolution never fetches it and the injected sitecustomize
+    // shim's own `import backports.strenum` silently failed (site.py swallows
+    // sitecustomize errors), leaving `enum.StrEnum` unpatched and the real
+    // crash this was supposed to prevent happening anyway.
+    let extra_packages = crate::k8s::SITECUSTOMIZE_SUPPORT_PACKAGES.join(" ");
     let script = format!(
-        "set -eu; rm -rf {dest}; mkdir -p {dest}; pip download --no-cache-dir --ignore-requires-python --dest {dest} {}; ls -1 {dest}",
+        "set -eu; rm -rf {dest}; mkdir -p {dest}; pip download --no-cache-dir --ignore-requires-python --dest {dest} {} {extra_packages}; ls -1 {dest}",
         driver.pip_package
     );
 
