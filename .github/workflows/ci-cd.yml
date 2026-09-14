@@ -78,8 +78,9 @@ jobs:
           cache-to: type=gha,mode=max
 
   # Packages and publishes the Helm chart as an OCI artifact to Docker Hub
-  # (oci://registry-1.docker.io/estenrye), gated to real releases only --
-  # chart versions should track app releases, not every branch push.
+  # (oci://registry-1.docker.io/estenrye/charts), gated to real releases
+  # only -- chart versions should track app releases, not every branch
+  # push.
   helm:
     name: Package & push Helm chart
     needs: docker
@@ -115,4 +116,12 @@ jobs:
           helm registry login registry-1.docker.io \
             --username "$DOCKERHUB_USERNAME" \
             --password "$DOCKERHUB_TOKEN"
-          helm push .helm-dist/*.tgz oci://registry-1.docker.io/estenrye
+          # A bare `oci://registry-1.docker.io/estenrye` destination resolves
+          # to `estenrye/neutron-ml2-guardian:<version>` (helm appends the
+          # chart name and version automatically) -- the exact same
+          # repo:tag the docker job above just pushed the container image
+          # to. Confirmed live, 2026-09-14: this silently clobbered the
+          # v0.1.0 container image manifest with the chart's, since OCI
+          # tags aren't namespaced by artifact type. `charts/` keeps the
+          # two on separate paths.
+          helm push .helm-dist/*.tgz oci://registry-1.docker.io/estenrye/charts
