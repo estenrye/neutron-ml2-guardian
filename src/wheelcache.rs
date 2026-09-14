@@ -84,8 +84,19 @@ pub async fn refresh(
     // compatible constraint, which is why this project's wheel cache kept
     // resolving a stale `unifi-ml2-driver==1.0.5` instead of a newer,
     // already-fixed release.
+    // `rm -rf {dest}` before `mkdir -p`: found live, 2026-09-14 -- pip
+    // download only ever adds files to `dest`, it never removes anything
+    // already there, so switching a driver's pip_package (e.g. to a fixed
+    // fork under a different distribution name) left the *old* package's
+    // wheels sitting alongside the new ones, with no version relationship
+    // pip could see between them. The next repair's install step pulled in
+    // both dependency trees together and pip's resolver failed outright on
+    // the resulting conflict (two different `tooz` versions "requested").
+    // A clean directory every refresh is what actually matches this
+    // cache's job: reflect the current resolution, not every historical
+    // one.
     let script = format!(
-        "set -eu; mkdir -p {dest}; pip download --no-cache-dir --ignore-requires-python --dest {dest} {}; ls -1 {dest}",
+        "set -eu; rm -rf {dest}; mkdir -p {dest}; pip download --no-cache-dir --ignore-requires-python --dest {dest} {}; ls -1 {dest}",
         driver.pip_package
     );
 
