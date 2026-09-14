@@ -58,31 +58,32 @@ const WHEELCACHE_MOUNT_PATH: &str = "/wheelcache";
 /// Secret or a user-provided `extraConfigSecretRef`.
 pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 
-/// Back-ports Python 3.11+ stdlib additions onto an older interpreter:
+/// Back-ports Python 3.11+ additions onto an older interpreter:
 /// `typing.Self` (PEP 673), `typing.NotRequired`/`Required` (PEP 655) from
-/// the `typing_extensions` backport, and `enum.StrEnum` from the
-/// `backports.strenum` backport. `typing_extensions` is genuinely already
-/// present in the target image (a near-universal transitive dependency of
-/// the OpenStack/oslo stack, see `ASSUMED_PRESENT_PACKAGES`), but
-/// `backports.strenum` is not -- and, confirmed live, 2026-09-14, can't be
-/// relied on to arrive as a transitive dependency either:
-/// `aiohttp-unifi`'s own published metadata declares only `aiohttp`,
-/// `orjson`, and `segno` as dependencies, despite its code needing both
-/// backports on <3.11 -- a real gap in that package's own packaging, not
-/// something this project's dependency resolution can discover. See
+/// the `typing_extensions` backport, `enum.StrEnum` from the
+/// `backports.strenum` backport, and `asyncio.timeout` (added in 3.11.0)
+/// from the `async_timeout` backport it was itself modeled after --
+/// confirmed API-compatible (`timeout(delay)` used as `async with
+/// timeout(...):`, same as the real one). `typing_extensions` is genuinely
+/// already present in the target image (a near-universal transitive
+/// dependency of the OpenStack/oslo stack, see `ASSUMED_PRESENT_PACKAGES`),
+/// and `async_timeout` reliably arrives as a real transitive dependency of
+/// `aiohttp` itself (which needs the same back-port for the same reason,
+/// and declares it correctly, unlike `aiohttp-unifi` below). But
+/// `backports.strenum` is not present and can't be relied on to arrive on
+/// its own either -- confirmed live, 2026-09-14: `aiohttp-unifi`'s own
+/// published metadata declares only `aiohttp`, `orjson`, and `segno` as
+/// dependencies, despite its code needing `backports.strenum` on <3.11 --
+/// a real gap in that package's own packaging, not something this
+/// project's dependency resolution can discover. See
 /// `SITECUSTOMIZE_SUPPORT_PACKAGES`, which `wheelcache::refresh` fetches
 /// unconditionally alongside whatever the configured driver needs, exactly
-/// to cover this. All three symbols found the same way: a real repair
-/// against `unifi-ml2-driver`'s `aiohttp-unifi` dependency crashed three
-/// times in a row, once per missing symbol,
-/// because most of that package's modules guard these imports with a
-/// `try`/`except ImportError` fallback but four specific files don't --
-/// confirmed by statically scanning every module in every cached wheel for
-/// unconditional imports of any Python 3.11+-only name, rather than
-/// continuing to fix these one crash at a time. `Required` isn't actually
-/// referenced unguarded anywhere found, but is PEP 655's other half and
-/// cheap to cover alongside `NotRequired`. Written into `PLUGIN_MOUNT_PATH`
-/// as `sitecustomize.py`, which Python's `site` module auto-imports at
+/// to cover this. All four gaps found the same way -- one real crash (or,
+/// for `asyncio.timeout`, one real `MechanismDriverError` on an actual
+/// `openstack network create`) at a time, each is a genuine gap between
+/// this specific target's Python 3.10 and what the driver's dependencies
+/// assume, not a guess. Written into `PLUGIN_MOUNT_PATH` as
+/// `sitecustomize.py`, which Python's `site` module auto-imports at
 /// interpreter startup for anything importable on `sys.path` -- PYTHONPATH
 /// included -- so this runs before neutron-server loads any mechanism
 /// driver. A single-line string with explicit `\n`s, deliberately not
@@ -91,7 +92,7 @@ pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 /// which silently ate this script's indentation the first time and produced
 /// an `IndentationError` -- confirmed live, see the design doc's incident
 /// writeup.
-const SITECUSTOMIZE_PY: &str = "import sys\nif sys.version_info < (3, 11):\n    import typing\n    import typing_extensions\n    for _name in (\"Self\", \"NotRequired\", \"Required\"):\n        if not hasattr(typing, _name):\n            setattr(typing, _name, getattr(typing_extensions, _name))\n    import enum\n    if not hasattr(enum, \"StrEnum\"):\n        from backports.strenum import StrEnum\n        enum.StrEnum = StrEnum\n";
+const SITECUSTOMIZE_PY: &str = "import sys\nif sys.version_info < (3, 11):\n    import typing\n    import typing_extensions\n    for _name in (\"Self\", \"NotRequired\", \"Required\"):\n        if not hasattr(typing, _name):\n            setattr(typing, _name, getattr(typing_extensions, _name))\n    import enum\n    if not hasattr(enum, \"StrEnum\"):\n        from backports.strenum import StrEnum\n        enum.StrEnum = StrEnum\n    import asyncio\n    if not hasattr(asyncio, \"timeout\"):\n        import async_timeout\n        asyncio.timeout = async_timeout.timeout\n";
 
 /// Packages `SITECUSTOMIZE_PY` itself needs at runtime (`backports.strenum`
 /// specifically), fetched unconditionally by `wheelcache::refresh`
