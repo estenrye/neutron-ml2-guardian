@@ -5,13 +5,16 @@
 # estenrye/pdns4-shim's Dockerfile (cross-compile rather than emulate,
 # distroless runtime, no C dependencies of our own since kube-rs and the
 # OTLP exporter both use rustls) -- see that file for the full rationale.
-# The one addition here: this image also bundles a pinned `helm` CLI
-# binary, since the guardian shells out to it rather than using a native
-# Helm SDK (see docs/specs/2026-09-13-neutron-ml2-guardian-design.md's
-# "Implementation decisions").
+#
+# No `helm` CLI bundled: the original plan shelled out to it for `helm
+# upgrade`, but reconstructing the guarded chart from its own Helm release
+# data turned out to be infeasible (subchart content lives in an unexported
+# Go field, invisible to the release's stored JSON -- see
+# docs/specs/2026-09-13-neutron-ml2-guardian-design.md and
+# src/reconcile.rs's module doc comment). The guardian now patches the
+# `neutron-etc` Secret directly instead, via the Kubernetes API only.
 
 ARG RUST_VERSION=1
-ARG HELM_VERSION=3.16.4
 
 FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS builder
 ARG TARGETARCH
@@ -48,19 +51,6 @@ COPY src ./src
 RUN cargo build --release --frozen --target "$(cat /rust_target.txt)" \
     && cp target/"$(cat /rust_target.txt)"/release/neutron-ml2-guardian /build/neutron-ml2-guardian
 
-# Fetches the pinned, statically-linked `helm` release binary for
-# $TARGETARCH. No cross-compilation needed here, unlike the Rust build
-# above -- just picking the right prebuilt tarball.
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS helm
-ARG TARGETARCH
-ARG HELM_VERSION
-WORKDIR /helm
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL "https://get.helm.sh/helm-v${HELM_VERSION}-linux-${TARGETARCH}.tar.gz" -o helm.tar.gz \
-    && tar -xzf helm.tar.gz "linux-${TARGETARCH}/helm" --strip-components=1 \
-    && chmod +x helm
-
 # hadolint ignore=DL3065
 FROM --platform=$TARGETPLATFORM gcr.io/distroless/cc-debian12:nonroot AS runtime
 WORKDIR /
@@ -69,7 +59,6 @@ WORKDIR /
 # exporter) reads the system trust store.
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /build/neutron-ml2-guardian /usr/local/bin/neutron-ml2-guardian
-COPY --from=helm /helm/helm /usr/local/bin/helm
 
 USER 65532:65532
 EXPOSE 8080

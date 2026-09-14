@@ -8,9 +8,6 @@ pub enum GuardianError {
     #[error("kubernetes API error: {0}")]
     Kube(#[from] kube::Error),
 
-    #[error("helm command failed: {0}")]
-    Helm(String),
-
     #[error("pod exec failed: {0}")]
     PodExec(String),
 

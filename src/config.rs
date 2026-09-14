@@ -15,7 +15,15 @@ use serde::Deserialize;
 /// One entry in `ml2Drivers`. See the design doc for the full rationale;
 /// summarized here: everything the guardian needs to know about a driver,
 /// without needing to understand what the driver's own config *means*.
+///
+/// `rename_all = "camelCase"` matters here, not just style: the Helm
+/// chart's `values.yaml` schema (and every example in this repo's docs)
+/// uses camelCase keys (`pipPackage`, `importModule`) to match Helm's own
+/// convention. Without this attribute, serde expects literal snake_case
+/// field names and every documented example would fail to parse -- caught
+/// by this module's own tests, not by inspection.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DriverSpec {
     /// Short id. Used as: the `mechanism_drivers` entry Neutron loads, the
     /// wheel-cache subdirectory name, and the extra-config-file basename.
@@ -90,13 +98,12 @@ pub struct Config {
     /// When true (the default), a detected-absent driver is logged with
     /// exactly what repair *would* do (the computed `mechanism_drivers`
     /// value, the injection patch, the wheel-cache refresh) without
-    /// actually calling `helm upgrade`, patching the Deployment, or
-    /// creating the download Job. Given the guardian's RBAC grant is
-    /// effectively "can run `helm upgrade neutron` and rewrite its
-    /// Deployment's pod spec," defaulting to dry-run means a fresh
-    /// deployment of this chart is safe to install and observe before
-    /// anyone deliberately flips it to `false`. See the design doc's
-    /// "Status" section.
+    /// actually patching the `neutron-etc` Secret, patching the Deployment,
+    /// or creating the download Job. Given the guardian can rewrite
+    /// `neutron-server`'s rendered config and pod spec directly, defaulting
+    /// to dry-run means a fresh deployment of this chart is safe to install
+    /// and observe before anyone deliberately flips it to `false`. See the
+    /// design doc's "Status" section.
     pub dry_run: bool,
 
     /// The drivers this guardian is responsible for keeping present.
@@ -135,17 +142,7 @@ impl Config {
             );
         }
 
-        let sole_drivers: Vec<&str> = drivers
-            .iter()
-            .filter(|d| d.sole_driver)
-            .map(|d| d.name.as_str())
-            .collect();
-        if sole_drivers.len() > 1 {
-            anyhow::bail!(
-                "more than one driver is flagged sole_driver ({:?}) -- these can't be combined, fix the drivers config",
-                sole_drivers
-            );
-        }
+        validate_sole_drivers(&drivers)?;
 
         Ok(Config {
             listen_addr,
@@ -167,7 +164,103 @@ fn load_drivers(path: &str) -> anyhow::Result<Vec<DriverSpec>> {
     }
     let raw = fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("reading drivers config {}: {e}", path.display()))?;
-    let parsed: DriverSpecFile = serde_yaml::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("parsing drivers config {}: {e}", path.display()))?;
+    parse_drivers_yaml(&raw)
+        .map_err(|e| anyhow::anyhow!("parsing drivers config {}: {e}", path.display()))
+}
+
+fn parse_drivers_yaml(raw: &str) -> anyhow::Result<Vec<DriverSpec>> {
+    let parsed: DriverSpecFile = serde_yaml::from_str(raw)?;
     Ok(parsed.ml2_drivers)
+}
+
+/// Refuses more than one `sole_driver`-flagged entry -- see
+/// `DriverSpec::sole_driver`'s doc comment for why combining two would
+/// silently produce a broken `mechanism_drivers` list.
+fn validate_sole_drivers(drivers: &[DriverSpec]) -> anyhow::Result<()> {
+    let sole_drivers: Vec<&str> = drivers
+        .iter()
+        .filter(|d| d.sole_driver)
+        .map(|d| d.name.as_str())
+        .collect();
+    if sole_drivers.len() > 1 {
+        anyhow::bail!(
+            "more than one driver is flagged sole_driver ({:?}) -- these can't be combined, fix the drivers config",
+            sole_drivers
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_drivers_yaml_single_driver() {
+        let yaml = r#"
+ml2Drivers:
+  - name: unifi
+    pipPackage: unifi-ml2-driver
+    importModule: unifi_ml2_driver
+    extraConfigSecretData: |
+      [unifi]
+      host = 192.168.1.1
+"#;
+        let drivers = parse_drivers_yaml(yaml).unwrap();
+        assert_eq!(drivers.len(), 1);
+        assert_eq!(drivers[0].name, "unifi");
+        assert_eq!(drivers[0].pip_package, "unifi-ml2-driver");
+        assert_eq!(drivers[0].import_module, "unifi_ml2_driver");
+        assert!(drivers[0].extra_config_secret_data.contains("[unifi]"));
+        assert!(!drivers[0].sole_driver);
+    }
+
+    #[test]
+    fn parse_drivers_yaml_defaults_optional_fields() {
+        let yaml = r#"
+ml2Drivers:
+  - name: unifi
+    pipPackage: unifi-ml2-driver
+    importModule: unifi_ml2_driver
+"#;
+        let drivers = parse_drivers_yaml(yaml).unwrap();
+        assert_eq!(drivers[0].extra_config_secret_data, "");
+        assert!(!drivers[0].sole_driver);
+    }
+
+    #[test]
+    fn validate_sole_drivers_allows_zero_or_one() {
+        let none = vec![];
+        assert!(validate_sole_drivers(&none).is_ok());
+
+        let one = vec![DriverSpec {
+            name: "a".into(),
+            pip_package: "a".into(),
+            import_module: "a".into(),
+            extra_config_secret_data: String::new(),
+            sole_driver: true,
+        }];
+        assert!(validate_sole_drivers(&one).is_ok());
+    }
+
+    #[test]
+    fn validate_sole_drivers_rejects_two() {
+        let two = vec![
+            DriverSpec {
+                name: "a".into(),
+                pip_package: "a".into(),
+                import_module: "a".into(),
+                extra_config_secret_data: String::new(),
+                sole_driver: true,
+            },
+            DriverSpec {
+                name: "b".into(),
+                pip_package: "b".into(),
+                import_module: "b".into(),
+                extra_config_secret_data: String::new(),
+                sole_driver: true,
+            },
+        ];
+        assert!(validate_sole_drivers(&two).is_err());
+    }
 }

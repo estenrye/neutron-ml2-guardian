@@ -192,3 +192,37 @@ pub fn classify(filenames: &[String]) -> GuardianResult<Portability> {
     }
     Ok(Portability::UniversalPureAny)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_all_universal_wheels_is_pure_any() {
+        let filenames = vec![
+            "unifi_ml2_driver-1.0.0-py3-none-any.whl".to_string(),
+            "stevedore-5.2.0-py3-none-any.whl".to_string(),
+        ];
+        assert_eq!(classify(&filenames).unwrap(), Portability::UniversalPureAny);
+    }
+
+    #[test]
+    fn classify_one_compiled_wheel_is_version_pinned() {
+        let filenames = vec![
+            "unifi_ml2_driver-1.0.0-py3-none-any.whl".to_string(),
+            "aiohttp-3.9.0-cp310-cp310-manylinux_2_17_x86_64.whl".to_string(),
+        ];
+        assert_eq!(classify(&filenames).unwrap(), Portability::VersionPinned);
+    }
+
+    #[test]
+    fn classify_unrecognized_filename_fails_safe_to_version_pinned() {
+        let filenames = vec!["not-a-real-wheel-filename".to_string()];
+        assert_eq!(classify(&filenames).unwrap(), Portability::VersionPinned);
+    }
+
+    #[test]
+    fn classify_empty_list_errors() {
+        assert!(classify(&[]).is_err());
+    }
+}

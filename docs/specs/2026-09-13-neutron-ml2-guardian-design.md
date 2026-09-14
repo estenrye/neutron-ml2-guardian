@@ -125,32 +125,62 @@ requiring a refresh whenever the observed image's Python version changes.
 
 ## Repair logic
 
-1. `mechanism_drivers`: read the release's current computed value, compute
-   *"current list + this driver's name if missing"* (never a hardcoded
-   string, so a future PCD default change isn't clobbered), and apply via
-   `helm upgrade --reuse-values --set conf.neutron.ml2_conf.ml2.mechanism_drivers=...`.
+**Revised 2026-09-14 -- no Helm involved at all, for either read or write.**
+The original plan was to read the release's current `mechanism_drivers`
+value via `helm get values` and apply the change via `helm upgrade
+--reuse-values --set ...`, using a chart reference pulled directly out of
+the release's own stored data (to avoid needing an external chart repo).
+That chart-extraction idea was tested directly against the live cluster and
+is a dead end: Helm's `chart.Chart` Go struct keeps subchart data in an
+*unexported* `dependencies` field, which `encoding/json` silently omits
+from everything Helm stores about a release. Decoding the real
+`sh.helm.release.v1.neutron.v1` Secret confirmed this empirically -- the
+reconstructed chart's `templates` list contained only the parent chart's
+own files, missing the `helm-toolkit` and `ovn` subcharts entirely, and a
+`helm upgrade --dry-run` against that reconstruction failed immediately:
+`found in Chart.yaml, but missing in charts/ directory: helm-toolkit, ovn`.
+This isn't specific to a missing implementation detail -- there is no
+`helm` CLI incantation that recovers this data, because it was never
+serialized in the first place.
+
+The actual fix is simpler than the original plan anyway: `ml2_conf.ini`
+isn't re-templated at pod startup at all. It's a **static key in the
+`neutron-etc` Secret**, mounted onto `neutron-server` via `subPath` at
+`/etc/neutron/plugins/ml2/ml2_conf.ini` (confirmed live) -- already the
+exact final rendered text, produced once by Helm's own templating at
+install/upgrade time. Repair now:
+
+1. Reads `neutron-etc`'s `ml2_conf.ini` key directly (`k8s::get_secret_key`)
+   and computes *"current mechanism_drivers list + this driver's name if
+   missing"* (`reconcile::add_driver_to_ml2_conf` -- never a hardcoded
+   string, preserving every other line byte-for-byte), then patches just
+   that one key back (`k8s::patch_secret_key`) if it changed. No `helm`
+   binary needed in the image at all anymore.
 2. Write the driver's `extraConfigSecretData` (if any) into its own Secret.
 3. Refresh the wheel cache (see above) and classify what it produced.
-4. **Re-apply the Deployment injection patch.** This is *not* preserved by
-   the `helm upgrade` in step 1 -- Helm computes its upgrade patch from its
-   own release history, which never included this out-of-band addition, so
-   any `helm upgrade` of this release (including the guardian's own
-   `mechanism_drivers` fix) can silently drop it. It must be reapplied
-   every repair cycle, not treated as one-time setup.
+4. **Re-apply the Deployment injection patch**, which now also
+   unconditionally bumps a `neutron-ml2-guardian/restarted-at` pod-template
+   annotation (`k8s::apply_injection_patch`). This is the piece that forces
+   a fresh rollout: `subPath` mounts are never hot-reloaded by kubelet, so
+   without a pod template change, running pods would never pick up the
+   just-patched `ml2_conf.ini` even though the Secret itself is already
+   correct. The injection patch itself is still *not* preserved by any
+   future `helm upgrade` of this release (Helm computes its patch from its
+   own release history, which never included this out-of-band addition),
+   so it's reapplied every repair cycle regardless of whether its own
+   content changed.
 5. Re-run the full "present" check to confirm the repair actually took
-   effect before declaring success -- a `helm upgrade`/`kubectl patch`
-   exiting 0 doesn't mean the driver actually loaded.
+   effect before declaring success -- exiting 0 on the patch calls doesn't
+   mean the driver actually loaded.
 
-Implemented in `src/reconcile.rs::repair`.
-
-**Known implementation gap:** `helm upgrade` needs a chart reference, and
-per the design intent that should be pulled directly out of the release's
-own stored data (avoiding any external chart-repo dependency) via
-something like `helm get metadata`/`helm pull` against the running
-release. This repo's first pass (`src/reconcile.rs::repair`) has a
-placeholder chart reference and explicitly does not resolve this yet --
-confirming the exact `helm` subcommand/flow for this against a real PCD
-cluster is the next concrete step before this can run for real.
+Implemented in `src/reconcile.rs::repair`. A real end-to-end validation of
+step 1's *mechanism* (reconstruct-and-dry-run, not the final Secret-patch
+design) was performed against the live cluster on 2026-09-14 via manual
+`kubectl`/`helm` commands, confirming both that the chart-reconstruction
+path fails as described above and that `neutron-etc`'s `ml2_conf.ini`
+content matches what `kubectl exec ... cat` returns from the running pod.
+The Rust implementation of the *replacement* approach has not yet been
+exercised against the cluster with `DRY_RUN=false`.
 
 ## Safety rails
 
@@ -161,15 +191,18 @@ cluster is the next concrete step before this can run for real.
   instead of repeatedly restarting a broken deployment.
 - **Least-privilege, cross-namespace RBAC.** A `Role` (not `ClusterRole`)
   scoped to the target namespace only (`deploy/helm/.../templates/role.yaml`),
-  bound to the guardian's ServiceAccount from its own namespace. This is
-  worth calling out plainly: this grant is effectively "can run `helm
-  upgrade neutron` and rewrite its Deployment's pod spec" -- review and
-  approve it deliberately, don't treat it as routine.
-- **Scoped to one release, by name.** The guardian never touches any Helm
-  release other than the one configured (`helmReleaseName`, default
-  `neutron`).
-- **Idempotent.** No `helm upgrade`/`kubectl patch` call at all on a
-  reconcile tick where the present-check already passes.
+  bound to the guardian's ServiceAccount from its own namespace, and named
+  to specific resources (`resourceNames` on the Deployment) rather than the
+  chart's full surface -- narrower than an earlier draft of this Role,
+  since dropping the `helm upgrade` approach (see "Repair logic" above)
+  removed the need for broad access across whatever resource kinds the
+  `neutron` chart happens to render. Still worth reviewing deliberately: it
+  can rewrite `neutron-server`'s rendered config and pod spec directly.
+- **Scoped to specific named resources.** The guardian never touches any
+  Deployment/Secret other than the ones it's explicitly configured for
+  (`deploymentName`, `neutron-etc`, and its own per-driver config Secrets).
+- **Idempotent.** No Secret/Deployment patch call at all on a reconcile
+  tick where the present-check already passes.
 - **Observability rides on the target cluster's own stack.** `/metrics`
   is annotated for Prometheus auto-discovery
   (`prometheus.io/scrape`) rather than needing a separate observability
@@ -207,11 +240,13 @@ rather than silently producing a broken `mechanism_drivers` list.
 
 ## Implementation decisions
 
-- **Language/tooling: Rust + `kube-rs`, shelling out to the bundled `helm`
-  CLI binary** (see `src/helm.rs`), rather than Go + Helm's native SDK.
-  Consistent with `estenrye/pdns4-shim`'s existing stack and this
-  ecosystem's general preference for shelling out to well-tested CLI tools
-  over reimplementing their logic.
+- **Language/tooling: Rust + `kube-rs`**, consistent with
+  `estenrye/pdns4-shim`'s existing stack. Originally paired with shelling
+  out to a bundled `helm` CLI binary for the `mechanism_drivers` change,
+  but that approach (and the `helm` binary along with it) was dropped once
+  the Secret-patching alternative in "Repair logic" above turned out to be
+  both simpler and not dependent on a chart reference that can't actually
+  be resolved. `kube-rs` alone now covers everything this controller does.
 - **Repair autonomy: fully automatic.** On detecting drift, the guardian
   immediately repairs without waiting for a human trigger -- reasonable for
   a home-lab context, with the safety rails above standing in for a
@@ -254,16 +289,28 @@ source:**
   `networking-generic-switch` ancestry rather than the real runtime path.
   `values.yaml`'s example has been corrected to this real schema.
 
+**Resolved 2026-09-14:** the `helm upgrade` chart-reference gap and the
+dry-run mode, both described in "Repair logic" and the "Implementation
+decisions" update above -- the chart-reference approach was replaced
+entirely (patch `neutron-etc` directly, no Helm involved), and `DRY_RUN`
+now defaults to `true`.
+
 **Still open before this is safe to actually run:**
-- The `helm upgrade` chart-reference resolution (see "Repair logic" above)
-  -- still a placeholder.
 - A real Prometheus text-format `/metrics` handler (OTLP export works
   today; the annotated-scrape path doesn't yet).
-- No test suite yet -- `wheelcache::classify` and the driver-config
-  YAML/`mechanism_drivers`-string parsing are pure functions and should be
-  the first ones covered, since they need no live cluster.
-- **A dry-run mode.** Given the guardian's RBAC grant is real ("can run
-  `helm upgrade neutron` and rewrite its Deployment's pod spec"), the first
-  run against a real cluster should log its intended `helm upgrade`
-  args/patch instead of executing them, so one cycle's output can be
-  reviewed before enabling fully-automatic repair. Not yet implemented.
+- No test suite yet -- `reconcile::add_driver_to_ml2_conf`,
+  `wheelcache::classify`, and the driver-config YAML parsing are all pure
+  functions and should be the first ones covered, since they need no live
+  cluster.
+- **`extraConfigSecretData` is written but never wired in.**
+  `k8s::write_driver_config_secret` creates the per-driver Secret, but
+  nothing yet mounts it or adds the corresponding `--config-file` argument
+  to the `neutron-server` process -- the "Generalizing" section above
+  describes the intended design, but `apply_injection_patch` doesn't
+  implement that part yet. A driver needing no extra config (just being
+  listed in `mechanism_drivers`) works today; one that needs its own config
+  section does not yet.
+- **Never actually run with `DRY_RUN=false`.** Everything in "Repair logic"
+  above is implemented and compiles, and the underlying Secret-patch
+  mechanism was validated by hand against the live cluster, but the Rust
+  code path itself has not yet performed a real repair end-to-end.

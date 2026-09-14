@@ -11,9 +11,24 @@ use std::time::Duration;
 use kube::Client;
 
 use crate::config::{Config, DriverSpec};
-use crate::error::GuardianResult;
+use crate::error::{GuardianError, GuardianResult};
 use crate::k8s::K8s;
-use crate::{helm, metrics, wheelcache};
+use crate::{metrics, wheelcache};
+
+/// Name of the Secret that holds every rendered Neutron config file as
+/// static keys (`ml2_conf.ini`, `neutron.conf`, ...), mounted onto
+/// `neutron-server` via `subPath` -- confirmed 2026-09-14 against the live
+/// cluster. This is a genuine simplification over the originally-planned
+/// `helm upgrade` approach: reconstructing the `neutron` chart from its own
+/// Helm release Secret turns out to be a dead end (Helm's `chart.Chart` Go
+/// struct keeps subchart data in an *unexported* field, invisible to the
+/// release's stored JSON -- confirmed by actually decoding the release
+/// Secret and finding `helm-toolkit`/`ovn` subchart templates genuinely
+/// absent, and a `helm upgrade --dry-run` against the reconstructed chart
+/// failing with exactly that missing-dependency error). Patching this
+/// Secret's `ml2_conf.ini` key directly needs no chart at all.
+const NEUTRON_ETC_SECRET_NAME: &str = "neutron-etc";
+const ML2_CONF_SECRET_KEY: &str = "ml2_conf.ini";
 
 /// After this many consecutive failed repairs for a given driver, stop
 /// attempting further repairs until the process restarts (a deliberate,
@@ -80,7 +95,7 @@ pub async fn run_once(
                 // Config::dry_run's doc comment and the design doc's
                 // "Status" section: this is the safe default until an
                 // operator deliberately sets DRY_RUN=false.
-                match describe_intended_repair(cfg, driver).await {
+                match describe_intended_repair(cfg, k8s, driver).await {
                     Ok(description) => {
                         tracing::warn!(driver = %driver.name, %description, "DRY RUN: driver absent, repair skipped (would apply the above)");
                     }
@@ -210,30 +225,71 @@ fn mechanism_drivers_line_includes(ml2_conf: &str, driver_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Computes (read-only -- one `helm get values` call, no mutation) a
+/// Rewrites `ml2_conf`'s `mechanism_drivers` line to add `driver_name` if
+/// it's missing, computed as *"whatever's currently there, plus this
+/// driver"* -- never a hardcoded list -- so a future PCD default change to
+/// the other drivers on that line isn't clobbered. Every other line is
+/// passed through byte-for-byte unchanged. Errors if no `mechanism_drivers`
+/// line exists at all (a malformed/unexpected `ml2_conf.ini` -- safer to
+/// fail than guess where to insert one).
+fn add_driver_to_ml2_conf(ml2_conf: &str, driver_name: &str) -> GuardianResult<String> {
+    let mut found = false;
+    let mut out_lines = Vec::new();
+
+    for line in ml2_conf.lines() {
+        if line.trim_start().starts_with("mechanism_drivers") {
+            found = true;
+            let current = line.split('=').nth(1).unwrap_or("");
+            let mut drivers: Vec<&str> = current
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !drivers.contains(&driver_name) {
+                drivers.push(driver_name);
+            }
+            out_lines.push(format!("mechanism_drivers = {}", drivers.join(",")));
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+
+    if !found {
+        return Err(GuardianError::Config(
+            "no mechanism_drivers line found in ml2_conf.ini -- refusing to guess where to insert one".into(),
+        ));
+    }
+
+    // `ml2_conf.lines()` drops the file's trailing newline (if any); restore
+    // one so this doesn't shrink the file by a byte every repair cycle.
+    let mut result = out_lines.join("\n");
+    if ml2_conf.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
+}
+
+/// Computes (read-only -- one Secret `get` call, no mutation) a
 /// human-readable description of what `repair` would do, for `DRY_RUN`
 /// mode. Deliberately mirrors `repair`'s own logic for the mechanism_drivers
 /// merge so the dry-run log line reflects the real computed value, not a
 /// guess.
-async fn describe_intended_repair(cfg: &Config, driver: &DriverSpec) -> GuardianResult<String> {
-    let values = helm::get_values(&cfg.target_namespace, &cfg.helm_release_name).await?;
-    let current = helm::mechanism_drivers_value(&values).unwrap_or_default();
-    let mut drivers: Vec<&str> = current
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !drivers.contains(&driver.name.as_str()) {
-        drivers.push(&driver.name);
-    }
-    let new_value = drivers.join(",");
+async fn describe_intended_repair(
+    cfg: &Config,
+    k8s: &K8s,
+    driver: &DriverSpec,
+) -> GuardianResult<String> {
+    let current_ml2_conf = k8s
+        .get_secret_key(NEUTRON_ETC_SECRET_NAME, ML2_CONF_SECRET_KEY)
+        .await?;
+    let new_ml2_conf = add_driver_to_ml2_conf(&current_ml2_conf, &driver.name)?;
+    let changed = new_ml2_conf != current_ml2_conf;
 
     Ok(format!(
-        "helm upgrade {} --set conf.neutron.ml2_conf.ml2.mechanism_drivers={new_value}; \
+        "patch secret {NEUTRON_ETC_SECRET_NAME}/{ML2_CONF_SECRET_KEY} (mechanism_drivers change: {changed}); \
          write extra-config secret: {}; \
          refresh wheel cache for pip package {}; \
-         patch deployment {} to inject initContainer {} + PYTHONPATH",
-        cfg.helm_release_name,
+         patch deployment {} to inject initContainer {} + PYTHONPATH, forcing a rollout",
         !driver.extra_config_secret_data.is_empty(),
         driver.pip_package,
         cfg.deployment_name,
@@ -248,34 +304,21 @@ async fn repair(
     deployment: &k8s_openapi::api::apps::v1::Deployment,
     driver: &DriverSpec,
 ) -> GuardianResult<()> {
-    // 1. mechanism_drivers: current list (from live values) + this driver,
-    //    never a hardcoded string -- see the design doc.
-    let values = helm::get_values(&cfg.target_namespace, &cfg.helm_release_name).await?;
-    let current = helm::mechanism_drivers_value(&values).unwrap_or_default();
-    let mut drivers: Vec<&str> = current
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !drivers.contains(&driver.name.as_str()) {
-        drivers.push(&driver.name);
+    // 1. mechanism_drivers: patch the neutron-etc Secret's ml2_conf.ini key
+    //    directly (current content + this driver, never a hardcoded list --
+    //    see the design doc and add_driver_to_ml2_conf). No Helm involved:
+    //    reconstructing the neutron chart from its own release data to run
+    //    `helm upgrade` turned out to be a dead end (subchart content isn't
+    //    recoverable from the release Secret -- see the module doc comment
+    //    above), and this is simpler anyway.
+    let current_ml2_conf = k8s
+        .get_secret_key(NEUTRON_ETC_SECRET_NAME, ML2_CONF_SECRET_KEY)
+        .await?;
+    let new_ml2_conf = add_driver_to_ml2_conf(&current_ml2_conf, &driver.name)?;
+    if new_ml2_conf != current_ml2_conf {
+        k8s.patch_secret_key(NEUTRON_ETC_SECRET_NAME, ML2_CONF_SECRET_KEY, &new_ml2_conf)
+            .await?;
     }
-    let new_value = drivers.join(",");
-
-    // NOTE: the chart reference for `helm upgrade` (pulled from the
-    // release's own stored chart, per the design doc) is not yet
-    // implemented here -- this is the one piece that needs verifying
-    // against the real cluster (`helm get metadata`/`helm pull` semantics)
-    // before this can run for real. Left as an explicit gap rather than a
-    // guess.
-    let chart_ref = format!("oci://unresolved/{}", cfg.helm_release_name);
-    helm::upgrade_set_values_with_chart(
-        &cfg.target_namespace,
-        &cfg.helm_release_name,
-        &chart_ref,
-        &[("conf.neutron.ml2_conf.ml2.mechanism_drivers", &new_value)],
-    )
-    .await?;
 
     // 2. Driver-specific extra config, if any.
     k8s.write_driver_config_secret(driver).await?;
@@ -314,4 +357,68 @@ async fn repair(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_ML2_CONF: &str = "[ml2]\n\
+        extension_drivers = port_security,qos,dns_domain_keywords\n\
+        mechanism_drivers = openvswitch,ovn\n\
+        path_mtu = 9000\n\
+        tenant_network_types = \n";
+
+    #[test]
+    fn mechanism_drivers_line_includes_true_and_false() {
+        assert!(mechanism_drivers_line_includes(SAMPLE_ML2_CONF, "ovn"));
+        assert!(mechanism_drivers_line_includes(
+            SAMPLE_ML2_CONF,
+            "openvswitch"
+        ));
+        assert!(!mechanism_drivers_line_includes(SAMPLE_ML2_CONF, "unifi"));
+    }
+
+    #[test]
+    fn add_driver_to_ml2_conf_appends_when_missing() {
+        let updated = add_driver_to_ml2_conf(SAMPLE_ML2_CONF, "unifi").unwrap();
+        assert!(mechanism_drivers_line_includes(&updated, "unifi"));
+        // Every other line preserved untouched.
+        assert!(updated.contains("path_mtu = 9000"));
+        assert!(updated.contains("extension_drivers = port_security,qos,dns_domain_keywords"));
+        // Existing drivers not dropped.
+        assert!(mechanism_drivers_line_includes(&updated, "ovn"));
+        assert!(mechanism_drivers_line_includes(&updated, "openvswitch"));
+    }
+
+    #[test]
+    fn add_driver_to_ml2_conf_is_idempotent() {
+        let once = add_driver_to_ml2_conf(SAMPLE_ML2_CONF, "unifi").unwrap();
+        let twice = add_driver_to_ml2_conf(&once, "unifi").unwrap();
+        assert_eq!(once, twice);
+        // Only one occurrence, not appended again.
+        let line = twice
+            .lines()
+            .find(|l| l.trim_start().starts_with("mechanism_drivers"))
+            .unwrap();
+        assert_eq!(line.matches("unifi").count(), 1);
+    }
+
+    #[test]
+    fn add_driver_to_ml2_conf_preserves_trailing_newline() {
+        let with_newline = "mechanism_drivers = ovn\n";
+        let without_newline = "mechanism_drivers = ovn";
+        assert!(add_driver_to_ml2_conf(with_newline, "unifi")
+            .unwrap()
+            .ends_with('\n'));
+        assert!(!add_driver_to_ml2_conf(without_newline, "unifi")
+            .unwrap()
+            .ends_with('\n'));
+    }
+
+    #[test]
+    fn add_driver_to_ml2_conf_errors_without_mechanism_drivers_line() {
+        let result = add_driver_to_ml2_conf("[ml2]\ntype_drivers = vlan\n", "unifi");
+        assert!(result.is_err());
+    }
 }

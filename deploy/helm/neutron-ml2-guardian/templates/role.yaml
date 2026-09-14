@@ -1,10 +1,17 @@
 {{/*
 Lives in .Values.targetNamespace, not .Release.Namespace -- a cross-
 namespace Role bound (see rolebinding.yaml) to this release's ServiceAccount
-from the guardian's own namespace. This is a meaningfully powerful grant --
-see docs/specs/2026-09-13-neutron-ml2-guardian-design.md's "Safety rails"
-section: it is effectively "can run `helm upgrade neutron` and rewrite its
-Deployment's pod spec." Review it deliberately, don't rubber-stamp it.
+from the guardian's own namespace. Narrower than an earlier draft of this
+chart: the original design needed broad access across whatever resource
+kinds the `neutron` chart renders, to support running `helm upgrade` for
+the mechanism_drivers change. That approach turned out to be infeasible
+(see docs/specs/2026-09-13-neutron-ml2-guardian-design.md and
+src/reconcile.rs's module doc comment: reconstructing the chart from its
+own Helm release data can't recover subchart content) and was replaced
+with patching the neutron-etc Secret directly -- so this Role only needs
+access to specific, named resources, not the chart's full surface. Still
+worth reviewing deliberately: it can rewrite neutron-server's rendered
+config and pod spec directly.
 */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -13,7 +20,7 @@ metadata:
   namespace: {{ .Values.targetNamespace }}
 rules:
   # Read the guarded Deployment and patch its pod spec (initContainer +
-  # volumes + PYTHONPATH injection).
+  # volumes + PYTHONPATH injection + the restart-forcing annotation).
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: [{{ .Values.deploymentName | quote }}]
@@ -30,34 +37,17 @@ rules:
     resources: ["pods/log"]
     verbs: ["get"]
 
-  # Read the neutron Helm release's stored values/chart (Helm release data
-  # is stored as Secrets named sh.helm.release.v1.<release>.v<revision>),
-  # and read/write per-driver extra-config Secrets this chart itself
-  # manages.
+  # neutron-etc (the Secret holding every rendered Neutron config file,
+  # including ml2_conf.ini -- patched directly, see reconcile.rs) and the
+  # per-driver extra-config Secrets this chart creates. "create" is needed
+  # alongside "patch" because server-side apply performs an implicit create
+  # the first time a per-driver Secret is written.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "create", "patch", "update"]
+    verbs: ["get", "patch", "create"]
 
-  # The wheel-download Job, created fresh on each cache refresh.
+  # The wheel-download Job, created fresh on each cache refresh, and its
+  # pod's logs (read via pods/log above) for the filename list it produced.
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "create", "delete"]
-
-  # The shared wheelcache PVC (see pvc.yaml) -- read-only from the
-  # guardian's own perspective (it doesn't mount this itself, but Helm's
-  # patch/apply flow for `helm upgrade`-driven resources needs get access).
-  - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
-    verbs: ["get"]
-
-  # ConfigMaps/other resource kinds the `neutron` chart's own templates
-  # render, needed for the `helm upgrade --set mechanism_drivers=...` repair
-  # step to succeed (Helm computes and applies a patch across whatever the
-  # chart defines -- this must cover its full resource surface, not just
-  # the Deployment).
-  - apiGroups: [""]
-    resources: ["configmaps", "services"]
-    verbs: ["get", "list", "create", "patch", "update"]
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["list"]

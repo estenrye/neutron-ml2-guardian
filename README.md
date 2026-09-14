@@ -80,9 +80,10 @@ This installs:
 - The guardian itself (its own namespace).
 - A `Role`/`RoleBinding` in `targetNamespace` granting the guardian access
   there (cross-namespace, on purpose -- see the design doc's "Safety
-  rails": this is a meaningfully powerful grant, effectively "can run `helm
-  upgrade neutron` and rewrite its Deployment's pod spec," and should be
-  reviewed deliberately).
+  rails": this can rewrite `neutron-server`'s rendered config and pod spec
+  directly, a meaningfully powerful grant, and should be reviewed
+  deliberately -- though narrower than an earlier draft, since it no longer
+  needs `helm upgrade`, see the design doc's "Repair logic").
 - A shared `ReadWriteMany` PVC for the wheel cache, in `targetNamespace`
   (needs a storage class that actually supports RWX -- NFS-backed is the
   common answer; set `wheelcache.storageClassName`).
@@ -90,23 +91,26 @@ This installs:
 By default (`dryRun: true`) it will not actually touch the target release --
 it logs exactly what a repair would do (the computed `mechanism_drivers`
 value, the intended Deployment patch, the wheel-cache refresh) without
-calling `helm upgrade`, patching anything, or creating a Job. Watch a few
-reconcile cycles' logs, confirm they look right, then deliberately set
-`dryRun: false` (`--set dryRun=false` or in your values file) to let it
-actually repair. This default exists specifically because the RBAC grant
-above is real power and shouldn't run unattended before you've seen what it
-intends to do.
+patching anything or creating a Job. Watch a few reconcile cycles' logs,
+confirm they look right, then deliberately set `dryRun: false` (`--set
+dryRun=false` or in your values file) to let it actually repair. This
+default exists specifically because the RBAC grant above is real power and
+shouldn't run unattended before you've seen what it intends to do.
 
 ## Status
 
-**First-pass scaffold, not yet run against a real cluster.** It builds
-clean (`cargo check`, `cargo clippy -- -D warnings`) and the Helm chart
-lints/renders. `PYTHONPATH` propagation and the real container name have
-since been verified against the live cluster (see the design doc's
-"Status" section) and a `dryRun`-default safety mode has been added, but
-the `helm upgrade` chart-reference resolution is still a placeholder and
-there's no test suite yet -- see that section for the full list before
-trusting this in production.
+**First-pass implementation, not yet run against a real cluster with
+`DRY_RUN=false`.** It builds clean (`cargo check`, `cargo clippy -- -D
+warnings`) and the Helm chart lints/renders. Verified against the live
+cluster: `PYTHONPATH` propagation, the real container name, and (via a
+manual, `--dry-run`-only reproduction) that patching `neutron-etc`'s
+`ml2_conf.ini` key directly is the right approach -- the originally-planned
+`helm upgrade` route turned out to be a dead end (Helm can't recover
+subchart data from its own release storage) and was replaced. Remaining
+gaps: no real Prometheus `/metrics` handler yet, no test suite, and a
+driver needing its own `extraConfigSecretData` isn't fully wired in yet
+(the Secret gets created but nothing mounts it into `neutron-server` yet) --
+see the design doc's "Status" section for the full list.
 
 ## Building and running
 

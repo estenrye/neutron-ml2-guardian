@@ -1,6 +1,5 @@
 mod config;
 mod error;
-mod helm;
 mod k8s;
 mod metrics;
 mod reconcile;

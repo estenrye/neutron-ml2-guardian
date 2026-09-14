@@ -1,17 +1,17 @@
 //! Kubernetes API access: reading the guarded Deployment/Pods, exec'ing into
-//! a live pod for the config/import checks, and patching in the
-//! initContainer/volume/env injection. Everything here is scoped to
+//! a live pod for the config/import checks, reading/patching the
+//! `neutron-etc` Secret directly (see `reconcile.rs`'s module doc comment
+//! for why this replaced a `helm upgrade`-based approach), and patching in
+//! the initContainer/volume/env injection. Everything here is scoped to
 //! `Config::target_namespace` -- this module never assumes `pcd` as a
 //! literal, per the design doc's note that the namespace is this cluster's
 //! convention, not a constant.
 //!
-//! NOTE: the exact container name inside the `neutron-server` pod
-//! (`neutron-server` is assumed below, matching the Helm chart's own
-//! container naming convention seen in `helm get manifest`) and the
-//! resource names the `neutron` chart's `mechanism_drivers` `helm upgrade`
-//! touches have not yet been re-verified against a live cluster from this
-//! codebase -- confirm against the real cluster before trusting this in
-//! production. See `docs/specs/2026-09-13-neutron-ml2-guardian-design.md`.
+//! The main container name (`neutron-server`, hyphenated) and `PYTHONPATH`
+//! propagation through its real entrypoint were both confirmed against the
+//! live cluster on 2026-09-14 -- see
+//! `docs/specs/2026-09-13-neutron-ml2-guardian-design.md`'s "Status"
+//! section.
 
 use std::collections::BTreeMap;
 
@@ -223,9 +223,28 @@ impl K8s {
             install_targets.join(" "),
         );
 
+        // Unconditionally bumped on every call: Kubernetes only starts a new
+        // rollout (picking up a freshly-patched neutron-etc Secret key,
+        // which subPath mounts never hot-reload) when spec.template
+        // actually changes. If this call's initContainer/volume/env content
+        // happens to be byte-identical to what's already there (e.g. a
+        // repair that's only fixing the ml2_conf.ini Secret, not the
+        // injection itself), this annotation is what still forces a fresh
+        // rollout so the Secret change actually takes effect.
+        let restarted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+
         let patch = json!({
             "spec": {
                 "template": {
+                    "metadata": {
+                        "annotations": {
+                            "neutron-ml2-guardian/restarted-at": restarted_at
+                        }
+                    },
                     "spec": {
                         "volumes": [
                             { "name": PLUGIN_VOLUME_NAME, "emptyDir": {} },
@@ -261,6 +280,57 @@ impl K8s {
         self.deployments()
             .patch(
                 deployment_name,
+                &PatchParams::apply("neutron-ml2-guardian"),
+                &Patch::Apply(patch),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reads one key out of a Secret's `data` map as a UTF-8 string. Used to
+    /// read the *authoritative* `ml2_conf.ini` content directly from the
+    /// `neutron-etc` Secret (mounted via `subPath` on the real
+    /// `neutron-server` container -- confirmed 2026-09-14 against the live
+    /// cluster, see the design doc: this Secret key already holds the fully
+    /// Helm-templated final file content, statically, not something
+    /// re-rendered at pod startup), rather than the possibly-stale content
+    /// of a currently-running pod.
+    pub async fn get_secret_key(&self, name: &str, key: &str) -> GuardianResult<String> {
+        let secret = self.secrets().get(name).await?;
+        let bytes = secret
+            .data
+            .as_ref()
+            .and_then(|d| d.get(key))
+            .ok_or_else(|| GuardianError::Config(format!("secret {name} has no key {key}")))?;
+        String::from_utf8(bytes.0.clone()).map_err(|e| {
+            GuardianError::Internal(anyhow::anyhow!(
+                "secret {name}/{key} is not valid UTF-8: {e}"
+            ))
+        })
+    }
+
+    /// Patches a single key of an existing Secret's `stringData`, leaving
+    /// every other key untouched. Used to update just `ml2_conf.ini` inside
+    /// `neutron-etc` -- a Secret owned by the `neutron` Helm release, not by
+    /// this controller. Per the design doc: a subsequent real `helm
+    /// upgrade` of that release can and will overwrite this again (expected
+    /// -- that's the drift this whole controller exists to detect and
+    /// re-heal, not a bug in this patch).
+    pub async fn patch_secret_key(&self, name: &str, key: &str, value: &str) -> GuardianResult<()> {
+        let mut data = BTreeMap::new();
+        data.insert(key.to_string(), value.to_string());
+        let patch = Secret {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(self.namespace.clone()),
+                ..Default::default()
+            },
+            string_data: Some(data),
+            ..Default::default()
+        };
+        self.secrets()
+            .patch(
+                name,
                 &PatchParams::apply("neutron-ml2-guardian"),
                 &Patch::Apply(patch),
             )
