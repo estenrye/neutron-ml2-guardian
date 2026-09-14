@@ -26,19 +26,25 @@ reconcileIntervalSecs: 300
 
 # Safe by default: the guardian logs what a repair *would* do (the computed
 # mechanism_drivers value, the intended patch, the wheel-cache refresh) but
-# never actually calls `helm upgrade`, patches the Deployment, or creates a
-# Job while this is true. Its RBAC grant is real power (effectively "can run
-# `helm upgrade neutron` and rewrite its Deployment's pod spec") -- review a
-# dry-run cycle's logs before deliberately setting this to `false`.
+# never actually patches the neutron-etc Secret, patches the Deployment, or
+# creates a Job while this is true. It can rewrite neutron-server's rendered
+# config and pod spec directly, which is real power -- review a dry-run
+# cycle's logs before deliberately setting this to `false`.
 dryRun: true
 
-# Shared ReadWriteMany PVC for the wheel cache. Needs a storage class that
-# actually supports RWX (NFS-backed is the common home-lab answer, e.g. the
-# same TrueNAS-backed storage class used elsewhere in this environment) --
-# not yet defaulted to one here since that's environment-specific.
+# Shared ReadWriteMany PVC for the wheel cache. Defaults to "pcd-sc" --
+# Platform9 PCD's own default StorageClass (kubevirt.io.hostpath-provisioner)
+# -- deliberately, even though hostpath-backed storage isn't genuinely RWX
+# (it provisions a directory on a single node's local disk, not real shared
+# storage). This works in practice for PCD Community Edition, which is
+# typically single-node, and is likely to be correctly configured on-prem
+# installs too; it will not work on a real multi-node cluster, where this
+# must be overridden to an actual RWX-capable class (NFS-backed, etc.).
+# Still a plain overridable value -- override via --set/-f for any
+# environment where "pcd-sc" isn't right.
 wheelcache:
   pvcName: neutron-ml2-wheelcache
-  storageClassName: ""
+  storageClassName: "pcd-sc"
   size: 512Mi
 
 # The drivers this guardian keeps present. Each entry:

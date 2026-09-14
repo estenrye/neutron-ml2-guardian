@@ -295,6 +295,19 @@ decisions" update above -- the chart-reference approach was replaced
 entirely (patch `neutron-etc` directly, no Helm involved), and `DRY_RUN`
 now defaults to `true`.
 
+**Wheel cache storage class, decided 2026-09-14:** `pcd.rye.ninja` has
+exactly one StorageClass, `pcd-sc` (Platform9 PCD's own default),
+provisioner `kubevirt.io.hostpath-provisioner` -- confirmed node-local,
+`WaitForFirstConsumer` binding, not a genuinely RWX-capable class (a
+hostpath volume is one node's local disk, not real shared storage). Set as
+`values.yaml`'s default anyway, deliberately: PCD Community Edition is
+typically single-node, where this works in practice (multiple pods on the
+*only* node sharing one local directory), and on-prem installs are likely
+similarly configured. This will not work on an actual multi-node cluster,
+where `wheelcache.storageClassName` must be overridden to a real RWX class
+(NFS-backed, etc.) -- still a plain overridable values field, just with a
+different default than "empty."
+
 **Still open before this is safe to actually run:**
 - A real Prometheus text-format `/metrics` handler (OTLP export works
   today; the annotated-scrape path doesn't yet).

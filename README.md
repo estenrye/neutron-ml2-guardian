@@ -84,9 +84,15 @@ This installs:
   directly, a meaningfully powerful grant, and should be reviewed
   deliberately -- though narrower than an earlier draft, since it no longer
   needs `helm upgrade`, see the design doc's "Repair logic").
-- A shared `ReadWriteMany` PVC for the wheel cache, in `targetNamespace`
-  (needs a storage class that actually supports RWX -- NFS-backed is the
-  common answer; set `wheelcache.storageClassName`).
+- A shared `ReadWriteMany` PVC for the wheel cache, in `targetNamespace`.
+  Defaults to `pcd-sc`, Platform9 PCD's own default StorageClass -- checked
+  against a live PCD CE cluster and confirmed to be
+  `kubevirt.io.hostpath-provisioner`-backed, which is node-local rather
+  than genuinely RWX-capable. That's fine for PCD CE (typically
+  single-node) and likely fine for on-prem installs too, but it will not
+  work on an actual multi-node cluster -- override
+  `wheelcache.storageClassName` to a real RWX class (NFS-backed, etc.) if
+  yours is one.
 
 By default (`dryRun: true`) it will not actually touch the target release --
 it logs exactly what a repair would do (the computed `mechanism_drivers`
