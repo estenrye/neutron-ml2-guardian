@@ -452,12 +452,95 @@ image after a fix ships). This run got further:
   confirmed unaffected throughout both failed attempts -- same pod, same
   age, `3/3 Running`, the entire time.
 
-Next: re-deploy with this fix and confirm a full real repair succeeds
-end-to-end, including the post-repair present-check.
+**Third live attempt, same day: real repair completed, real outage,
+safely reverted -- and a serious design flaw in the core "no custom image"
+premise, not a small bug.** With the SSA/apiVersion fixes both in, the full
+repair actually completed: `mechanism_drivers` patched, wheel cache
+refreshed, and the Deployment injection patch succeeded and triggered a
+real rollout. The post-repair present-check correctly reported "absent" --
+but for the wrong reason at first glance, which led to finding a *second*
+real bug before finding the serious one:
 
-**Still open:**
-- Confirm the post-repair present-check (`mechanism_drivers` line +
-  `python3 -c "import unifi_ml2_driver"`) actually passes once the
-  initContainer has had a chance to run.
-- Confirm `neutron-server` itself comes back `Ready` and stable after the
-  injection patch finally triggers its first real rollout.
+- **Bug: the post-repair re-check reused a stale, pre-repair `Deployment`
+  object.** `run_once` fetches `deployment` once at the top, before
+  `repair()` runs, and passes that same (now-stale) value into the
+  post-repair `check_present` call -- so Layer 1 (`has_injection`) always
+  sees the pre-repair state regardless of what `repair()` actually did.
+  Not yet fixed as of this writing (moot for this incident, since the real
+  problem below made it need reverting anyway, but still a real bug to fix
+  before the next attempt: the post-repair check must re-fetch the
+  Deployment, not reuse the pre-repair copy).
+- **The actual serious problem**: the new `neutron-server` pod went
+  `CrashLoopBackOff` (2/3 Ready) with `ModuleNotFoundError: No module
+  named 'neutron.cmd.eventlet'`. Root cause: `pip install
+  --target=/opt/ml2-plugins unifi-ml2-driver` doesn't install just that
+  one package -- it resolves and installs its **entire declared
+  dependency closure**, which includes `neutron (>=13.0.0.0b1)` and
+  `neutron-lib (>=1.18.0)` themselves (see `unifi-ml2-driver`'s own
+  `pyproject.toml`). `PYTHONPATH` prepends `/opt/ml2-plugins` ahead of the
+  image's real site-packages in `sys.path`, so Python resolved `import
+  neutron` to the **freshly pip-installed, generic upstream package**
+  instead of `/var/lib/openstack/lib/python3.10/site-packages/neutron` --
+  the image's actual, Platform9-patched, OVN-customized one. The generic
+  one doesn't have (or lays out differently) `neutron.cmd.eventlet`,
+  hence the crash. This is a fundamental problem with "just `pip install
+  --target` a plugin's full dependency closure and prepend it via
+  `PYTHONPATH`" as a strategy for extending an existing, already-populated
+  Python environment -- it silently shadows any dependency the new
+  package happens to share with the base image, not just the ones that
+  are actually missing. Every design note in this doc calling the
+  runtime-injection approach a clean way to "avoid a custom image" was
+  correct about avoiding *image staleness*, but missed this *dependency
+  shadowing* risk entirely -- discovered only by actually running it.
+- **Recovery, done immediately, by hand** (the guardian was paused --
+  scaled to 0 -- for the duration, so it wouldn't reapply while this was
+  in progress): reverted `neutron-server`'s Deployment (strategic merge
+  patch, `$patch: delete` on the injected initContainer, both/all added
+  volumes, the `PYTHONPATH` env entry, and the added volumeMounts --
+  note `volumeMounts` for `Container` uses `mountPath`, not `name`, as
+  its strategic-merge-patch key, unlike `volumes`/`containers`/
+  `initContainers`), reverted `neutron-etc`'s `mechanism_drivers` back to
+  `openvswitch,ovn`, and reverted `neutron-bin`'s `neutron-server.sh`
+  back to its original `--config-file`-only form (the `--config-dir` flag
+  alone, pointed at a directory whose volume mount had just been removed,
+  produced a *second*, different crash --
+  `oslo_config.cfg.ConfigDirNotFoundError` -- on the first revert attempt,
+  before this third piece was also reverted). `neutron-server` came back
+  `3/3 Running` and confirmed processing real OVN/Nova port events
+  normally afterward. Total live-impact window: on the order of minutes,
+  fully self-contained to changes made in this same session, no user data
+  or unrelated state affected.
+- **What the "safe partial failure" design property actually delivered,
+  precisely**: it prevented the *first two* failed attempts (SSA conflict,
+  then the apiVersion/kind bug) from having any live impact at all, exactly
+  as designed -- those aborted before the rollout-triggering step. It does
+  **not** and structurally cannot protect against the injection succeeding
+  and being *wrong in its own content*, which is what actually happened
+  here. That's a different, harder problem this design doesn't yet solve.
+
+**Before any future `DRY_RUN=false` attempt, this needs an actual fix, not
+just a retry** -- likely one of:
+- Only `pip install --no-deps` the target driver package itself, and
+  separately resolve/install just its *genuinely new* dependencies
+  (e.g. for `unifi-ml2-driver`: `aiohttp-unifi`, `netmiko`, `etcd3gw`,
+  `tooz`, `tenacity`) while explicitly excluding the ones any real
+  `neutron-server` environment already has by definition of running
+  inside it (`neutron`, `neutron-lib`, `oslo-*`, `stevedore`, likely
+  `eventlet`) -- an ecosystem-level exclusion list, not a driver-specific
+  one, since *every* Neutron ML2 driver package will declare `neutron`/
+  `neutron-lib` as dependencies for exactly this reason.
+- Or: install into an isolated location and use a mechanism that only
+  falls back to it for imports the base environment can't already satisfy
+  (checked-last, not checked-first) -- `PYTHONPATH`'s prepend-only
+  semantics can't express this directly; would need the `.pth`-file
+  fallback approach mentioned earlier in this doc, adapted for
+  ordering rather than just as an alternative injection point, or a
+  custom `sitecustomize.py`/import-hook approach.
+- Either way: **test the exact resolved dependency list against the real
+  image's existing site-packages before the next live attempt** -- this
+  failure mode is now fully predictable in advance, not something that
+  requires another live-fire test to rediscover.
+
+Still true from the second attempt, now blocked behind the above: confirm
+the post-repair present-check and `neutron-server`'s stability once a real
+repair can be attempted safely again.

@@ -133,9 +133,28 @@ pub async fn run_once(
                     Ok(()) => {
                         metrics::record_repair(&driver.name, true);
                         // Re-check after repair before declaring success --
-                        // a `helm upgrade`/`kubectl patch` exiting 0 doesn't
-                        // mean the driver actually loaded.
-                        match check_present(cfg, k8s, &deployment, driver).await {
+                        // a `kubectl patch` exiting 0 doesn't mean the
+                        // driver actually loaded. Deliberately re-fetches
+                        // the Deployment here rather than reusing the
+                        // `deployment` binding captured at the top of this
+                        // function: that copy predates `repair()`, so
+                        // checking against it would always see the
+                        // pre-repair state regardless of what repair did --
+                        // a real bug caught during live testing 2026-09-14
+                        // (see the design doc's "Status" section).
+                        let post_repair_deployment = match k8s
+                            .get_deployment(&cfg.deployment_name)
+                            .await
+                        {
+                            Ok(d) => d,
+                            Err(e) => {
+                                bump_failure(state, &driver.name);
+                                metrics::record_repair_failure(&driver.name);
+                                tracing::error!(driver = %driver.name, error = %e, "repair applied but re-fetching the deployment for the post-repair check failed");
+                                continue;
+                            }
+                        };
+                        match check_present(cfg, k8s, &post_repair_deployment, driver).await {
                             CheckResult::Present => {
                                 state.consecutive_failures.remove(&driver.name);
                                 tracing::info!(driver = %driver.name, "repair confirmed");
