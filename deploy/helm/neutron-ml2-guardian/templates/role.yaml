@@ -26,13 +26,23 @@ rules:
     resourceNames: [{{ .Values.deploymentName | quote }}]
     verbs: ["get", "patch"]
 
-  # Find a Ready pod for the layered present-check, and exec into it.
+  # Find a Ready pod for the layered present-check, and exec into it. Both
+  # "create" and "get" are needed for pods/exec, not just the "create"
+  # documented as the RBAC convention for `kubectl exec`: that convention
+  # assumes the older SPDY transport, which upgrades via an HTTP POST
+  # (-> RBAC verb "create"). This controller's kube-rs client uses the
+  # newer WebSocket-based exec transport (the `ws` cargo feature), which
+  # upgrades via an HTTP GET (-> RBAC verb "get") -- confirmed live: with
+  # only "create" granted, every exec attempt failed with a 403 whose
+  # message read "cannot get resource \"pods/exec\"", even though
+  # `kubectl auth can-i create pods/exec` (and a POST-based exec via
+  # kubectl impersonating this ServiceAccount) both said yes.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["create"]
+    verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
