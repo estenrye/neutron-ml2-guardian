@@ -89,6 +89,7 @@ const ASSUMED_PRESENT_PACKAGES: &[&str] = &[
     "python_keystoneclient",
     "python_novaclient",
     "python_designateclient",
+    "python_neutronclient",
     "openstacksdk",
     "osc_lib",
     "cliff",
@@ -149,7 +150,16 @@ const ASSUMED_PRESENT_PACKAGES: &[&str] = &[
     "kombu",
     "vine",
     "cachetools",
-    "orjson",
+    // NOT "orjson": listed here in a first pass on the mistaken assumption
+    // that anything appearing in the dependency resolve must already be
+    // present -- it's an optional accelerator library some packages use
+    // if available, and the real target image genuinely doesn't have it.
+    // Confirmed the hard way: the first `DRY_RUN=false` attempt after this
+    // exclusion list existed still crashed, this time on `neutron_server`
+    // loading the `unifi` entry point itself with `ModuleNotFoundError: No
+    // module named 'orjson'` -- see the design doc's incident log. Kept as
+    // an explicit negative entry (rather than just omitted) so a future
+    // pass doesn't re-add it on the same flawed reasoning.
     "lxml",
     "httplib2",
     "pyparsing",

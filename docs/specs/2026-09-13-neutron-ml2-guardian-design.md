@@ -560,20 +560,74 @@ Two real mistakes this validation pass caught before they could cause a
   OpenStack-ecosystem-adjacent rather than UniFi-specific) wasn't on the
   list at all. Added.
 
-**Still true, and still the honest caveat**: this list is now
-evidence-based rather than guessed, but it's still an assumption that
-PCD's specific `pf9-neutron` image has every one of these ~85 packages
-already -- not independently verified item-by-item against that image's
-actual site-packages. A future repair that crashes on a *different*
-shadowed package should be read as "the list needs one more entry," not
-"the approach doesn't work." The next live `DRY_RUN=false` attempt is the
-first real test of both fixes together (this one, and the automated
-revert logic below) -- worth doing deliberately, not assumed safe just
-because the offline validation looked clean.
+**Fourth live attempt, 2026-09-14: real progress, one narrow miss, fixed
+and re-validated against the *real* target platform.** With both fixes
+(the exclusion list and automated revert) deployed, this attempt got
+significantly further than any before it: `neutron` loaded correctly (no
+more shadowing), ML2 loaded `['openvswitch', 'ovn', 'unifi']` correctly,
+and it reached the point of actually loading the `unifi` entry point
+itself -- which then failed with `ModuleNotFoundError: No module named
+'orjson'`.
+
+Root cause, and an important methodological lesson: the offline
+validation that produced the original ~85-entry exclusion list was run
+with `pip download` **on a local macOS/Python 3.14 machine**, not the
+target's Linux/Python 3.10. Platform- and interpreter-conditional
+dependency markers mean these two resolutions genuinely differ -- proven
+by fetching the *actual* wheel-cache contents from the live PVC (via a
+throwaway debug pod mounting it, `kubectl exec ... find /wheelcache
+-mindepth 2 -maxdepth 2`) and comparing against local validation: 147 real
+packages vs. 144 estimated locally, with real, meaningful differences
+(`python-neutronclient`, `pyroute2`, `tomli`, `backports.strenum`,
+`async-timeout` appear on the real platform and hadn't been seen locally
+at all). Two concrete bugs came from this, both found and fixed by
+re-validating against the *real* list before trusting a fix again, not by
+another live-fire guess:
+- **`orjson` was wrongly on the exclusion list in the first place.** It
+  had shown up in the original dependency dump and was assumed (wrongly)
+  to already be present -- it's an optional accelerator library some
+  packages use if available, and the real image genuinely doesn't have
+  it. The crash was direct proof. Removed, with an explicit comment
+  explaining why it's *not* there, so a future pass doesn't re-add it on
+  the same flawed reasoning.
+- **`python-neutronclient` was missing from the list entirely**, despite
+  its siblings (`python-keystoneclient`, `python-novaclient`,
+  `python-designateclient`) already being present -- a plain oversight,
+  caught once the real wheel list made it visible. Added.
+
+Also caught, while re-validating: the quick Python script used to extract
+`ASSUMED_PRESENT_PACKAGES` out of `k8s.rs` for testing wasn't
+comment-aware, and briefly "found" `orjson` again because the word
+appeared inside this very doc-comment's explanation of why it was
+removed. Not a code bug -- the actual `.rs` array was correct -- but a
+reminder that any tooling built to double-check this list needs to
+exclude comments the same way the compiler does.
+
+Re-validated the corrected list against the **real, authoritative** wheel
+list from the live PVC (not another local approximation): 45 packages
+survive the filter now (up from 44 -- `orjson` correctly included, and
+`python-neutronclient` correctly newly excluded), and every one of them is
+`unifi-ml2-driver` itself, its `aiohttp`/`aiohttp-unifi` stack,
+coordination libraries, network-automation tooling, or small
+CLI/testing/utility libraries -- nothing that looks like a core OpenStack
+package.
+
+**The updated, still-honest caveat**: this list is now validated against
+the actual target platform's actual resolved dependency set, not a
+cross-platform guess -- meaningfully stronger evidence than the previous
+pass had. It's still not verified item-by-item against `pf9-neutron`'s
+real site-packages (i.e., "resolved as a dependency" and "already
+installed in the base image" are still two different questions this
+approach conflates), so a future repair crashing on a *new* shadowed
+package remains possible and should still be read as "add one more
+entry," not "the approach is wrong." The debug pod and local files used
+for this validation were cleaned up afterward; this isn't a standing
+diagnostic tool, just how this specific investigation was done.
 
 Still true from the second attempt: confirm the post-repair present-check
 and `neutron-server`'s stability once a real repair can be attempted
-safely again.
+safely again -- now the actual next step, with meaningfully higher
+confidence than before.
 
 ## Automated revert: `DRY_RUN=true` now means "zero footprint," not just "don't touch anything"
 
@@ -622,8 +676,30 @@ New pure functions (`remove_driver_from_ml2_conf`,
 round-trip tests (`remove_X(add_X(input)) == input`) against the
 corresponding `add_X` functions.
 
-**Not yet live-tested**: the revert path compiles, passes its unit tests,
-and its underlying mechanism ($patch: delete) is proven from the manual
-incident recovery, but the automated version (triggered by the guardian
-itself, not a human running kubectl) hasn't been exercised end-to-end
-against a real injected footprint yet.
+**Live-tested twice on 2026-09-14, both times successfully, one
+genuinely on a real incident:**
+1. A self-inflicted deployment-sequencing mistake (scaling the guardian
+   back up *before* applying the values/image update that set
+   `DRY_RUN=true` and the fixed image) briefly let the *old*, pre-fix pod
+   run with `DRY_RUN=false` against an already-clean cluster, re-adding
+   `unifi` to `mechanism_drivers` and re-adding the `--config-dir` flag
+   before being replaced -- never reaching the Deployment injection step,
+   so `neutron-server` itself was never touched. The next (fixed,
+   `DRY_RUN=true`) pod correctly detected this partial footprint and
+   reverted it (`mechanism_drivers` and the `--config-dir` flag both), on
+   its very first reconcile tick, no human intervention. Confirmed a real
+   operational lesson too: always update values/image *before* scaling a
+   paused guardian back up, never after -- a stale-config replica can
+   start in the gap otherwise.
+2. **The real test**: after the fourth live repair attempt above crashed
+   `neutron-server` on the `orjson` gap, `DRY_RUN` was flipped back to
+   `true` (deliberately, as the actual recovery mechanism this time,
+   instead of the by-hand `kubectl patch` sequence the earlier incident
+   needed). The guardian detected the full footprint -- `mechanism_drivers`,
+   the `--config-dir` flag, *and* the injected initContainer/volumes/env --
+   and reverted all three, unprompted beyond the `DRY_RUN=true` flip.
+   `neutron-server` came back `3/3 Running` within roughly a minute, zero
+   restarts afterward, confirmed processing real API traffic (`GET
+   /v2.0/ports` returning `200`). This is the actual scenario the feature
+   was built for, working as designed, under genuine pressure -- not a
+   synthetic test.
