@@ -55,7 +55,7 @@ ml2Drivers:
     importModule: unifi_ml2_driver     # top-level module to test-import
     extraConfigSecretData: |           # opaque -- never parsed by the guardian
       [unifi]
-      host = 192.168.1.1
+      host = 10.45.0.1                 # real, verified reachable UDM-SE address for this cluster
       apikey = REPLACE_ME
       site = default
 ```

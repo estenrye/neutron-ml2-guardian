@@ -65,14 +65,20 @@ wheelcache:
 ml2Drivers: []
 # Example, using networking-unifi's real [unifi] config schema (verified
 # 2026-09-14 against unifi_ml2_driver/config.py -- apikey is preferred over
-# username/password when both are set):
+# username/password when both are set). host/site below are the real,
+# verified values for pcd.rye.ninja's UDM-SE (confirmed reachable and
+# authenticating via its Network Integration API -- GET
+# /proxy/network/integration/v1/sites returned HTTP 200 with one site,
+# internalReference "default" -- from both the PCD host and from inside a
+# pod's own network namespace in this cluster, 2026-09-14). apikey is never
+# a real value here -- see values.secrets.yaml convention in .gitignore.
 # ml2Drivers:
 #   - name: unifi
 #     pipPackage: unifi-ml2-driver
 #     importModule: unifi_ml2_driver
 #     extraConfigSecretData: |
 #       [unifi]
-#       host = 192.168.1.1
+#       host = 10.45.0.1
 #       apikey = REPLACE_ME
 #       site = default
 

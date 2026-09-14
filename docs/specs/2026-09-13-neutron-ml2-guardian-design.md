@@ -337,6 +337,22 @@ different default than "empty."
   actually gathers+encodes the Prometheus registry and checks the real
   output text, not just that instrument registration doesn't panic.
 
+**Resolved 2026-09-14 (continued): UDM-SE reachability and auth.** Verified
+directly (not assumed) that the UDM-SE is reachable at `10.45.0.1` and its
+Network Integration API authenticates, from **both** the PCD host and from
+inside a pod's own network namespace in this cluster (`kubectl exec` into
+the `neutron-server` pod, no `curl` available so done via Python's
+`urllib`): `GET https://10.45.0.1/proxy/network/integration/v1/sites` with
+header `X-API-KEY: <key>` returned HTTP 200 with one site,
+`internalReference: "default"` -- matching `unifi-ml2-driver`'s own `site`
+config default, so no non-default site name is needed. This also resolves
+the still-open item from `pcd-ce-deploy`'s original investigation spec
+about confirming the Integration API's exact endpoint/schema. `host =
+10.45.0.1` / `site = default` in `values.yaml`'s example are now real,
+verified values -- only `apikey` remains a placeholder (kept out of the
+repo; the real key lives in 1Password at
+`op://controlplane/unifi-os-xnetworksegment/credential`).
+
 **Still open before this is safe to actually run:**
 - **Never actually run with `DRY_RUN=false`.** Everything in "Repair logic"
   above is implemented and compiles, and the underlying Secret-patch
