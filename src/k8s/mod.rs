@@ -58,10 +58,16 @@ const WHEELCACHE_MOUNT_PATH: &str = "/wheelcache";
 /// Secret or a user-provided `extraConfigSecretRef`.
 pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 
-/// Back-ports `typing.Self` (PEP 673, Python 3.11+) onto the real `typing`
-/// module when running under an older interpreter, from the
-/// `typing_extensions` backport already assumed present in the target image
-/// (see `ASSUMED_PRESENT_PACKAGES`). Written into `PLUGIN_MOUNT_PATH` as
+/// Back-ports `typing.Self` (PEP 673) and `typing.NotRequired`/`Required`
+/// (PEP 655) -- all Python 3.11+ additions -- onto the real `typing` module
+/// when running under an older interpreter, from the `typing_extensions`
+/// backport already assumed present in the target image (see
+/// `ASSUMED_PRESENT_PACKAGES`). Not just `Self`: a real repair crashed a
+/// second time on `NotRequired` alone, from an import statement that named
+/// both symbols together (`from typing import NotRequired, Self,
+/// TypedDict`) -- a single unconditional import fails whole if *any* named
+/// attribute is missing, so both had to be covered, and `Required` is the
+/// same PEP's other half. Written into `PLUGIN_MOUNT_PATH` as
 /// `sitecustomize.py`, which Python's `site` module auto-imports at
 /// interpreter startup for anything importable on `sys.path` -- PYTHONPATH
 /// included -- so this runs before neutron-server loads any mechanism
@@ -71,7 +77,7 @@ pub const EXTRA_CONF_DIR: &str = "/etc/neutron-ml2-guardian/extra-conf.d";
 /// which silently ate this script's indentation the first time and produced
 /// an `IndentationError` -- confirmed live, see the design doc's incident
 /// writeup.
-const SITECUSTOMIZE_PY: &str = "import sys\nif sys.version_info < (3, 11):\n    import typing\n    if not hasattr(typing, \"Self\"):\n        import typing_extensions\n        typing.Self = typing_extensions.Self\n";
+const SITECUSTOMIZE_PY: &str = "import sys\nif sys.version_info < (3, 11):\n    import typing\n    import typing_extensions\n    for _name in (\"Self\", \"NotRequired\", \"Required\"):\n        if not hasattr(typing, _name):\n            setattr(typing, _name, getattr(typing_extensions, _name))\n";
 
 /// Package distribution names (wheel-filename form: non-alphanumeric runs
 /// become `_`, matched case-insensitively since wheel filenames preserve
