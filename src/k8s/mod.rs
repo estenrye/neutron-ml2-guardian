@@ -12,6 +12,20 @@
 //! live cluster on 2026-09-14 -- see
 //! `docs/specs/2026-09-13-neutron-ml2-guardian-design.md`'s "Status"
 //! section.
+//!
+//! Every `Patch::Apply` call here uses `PatchParams::apply(...).force()`.
+//! Discovered the hard way against the real cluster: every field on
+//! `neutron-etc`/`neutron-bin`/the guarded Deployment is already owned by
+//! field manager "helm" from the original `helm install`. Without
+//! `.force()`, server-side apply refuses the patch with a 409 conflict
+//! ("conflict with \"helm\" using v1: .data.neutron-server.sh") the moment
+//! the field path collides with one Helm already owns -- which is every
+//! field this controller needs to touch, definitionally. Forcing ownership
+//! away from Helm is not a workaround, it's the actual point of this
+//! controller: see `reconcile.rs`'s module doc comment on why Helm
+//! re-asserting its own ownership on a future real `helm upgrade` is
+//! expected drift this guardian exists to detect and re-heal, not a
+//! conflict to avoid.
 
 use std::collections::BTreeMap;
 
@@ -322,7 +336,7 @@ impl K8s {
         self.deployments()
             .patch(
                 deployment_name,
-                &PatchParams::apply("neutron-ml2-guardian"),
+                &PatchParams::apply("neutron-ml2-guardian").force(),
                 &Patch::Apply(patch),
             )
             .await?;
@@ -373,7 +387,7 @@ impl K8s {
         self.secrets()
             .patch(
                 name,
-                &PatchParams::apply("neutron-ml2-guardian"),
+                &PatchParams::apply("neutron-ml2-guardian").force(),
                 &Patch::Apply(patch),
             )
             .await?;
@@ -416,7 +430,7 @@ impl K8s {
         self.configmaps()
             .patch(
                 name,
-                &PatchParams::apply("neutron-ml2-guardian"),
+                &PatchParams::apply("neutron-ml2-guardian").force(),
                 &Patch::Apply(patch),
             )
             .await?;
@@ -452,7 +466,7 @@ impl K8s {
         self.secrets()
             .patch(
                 &name,
-                &PatchParams::apply("neutron-ml2-guardian"),
+                &PatchParams::apply("neutron-ml2-guardian").force(),
                 &Patch::Apply(secret),
             )
             .await?;

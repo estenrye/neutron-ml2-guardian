@@ -371,15 +371,64 @@ verified values -- only `apikey` remains a placeholder (kept out of the
 repo; the real key lives in 1Password at
 `op://controlplane/unifi-os-xnetworksegment/credential`).
 
-**Still open before this is safe to actually run:**
-- **Never actually run with `DRY_RUN=false`.** Everything in "Repair logic"
-  above is implemented and compiles, and the underlying Secret-patch
-  mechanism (including the `--config-dir` addition) was validated by hand
-  against the live cluster, but the Rust code path itself has not yet
-  performed a real repair end-to-end.
-- The `add_config_dir_flag` anchor-line match
-  (`ML2_CONF_FILE_FLAG_LINE`) was captured from `neutron-server.sh`'s
-  observed content on 2026-09-14 but hasn't been re-verified since the
-  extra-config wiring was added -- worth one more live diff before
-  `DRY_RUN=false`, in case anything about that script's exact formatting
-  was misremembered.
+**First live `DRY_RUN=false` attempt, 2026-09-14: partial failure, safely
+contained, root-caused and fixed.** Deployed for real against
+`pcd.rye.ninja` (release `neutron-ml2-guardian`, driver `unifi` via
+`extraConfigSecretRef`). The dry-run pass first (installed with
+`dryRun: true`, confirmed the logged intended action matched expectations
+exactly) caught nothing wrong -- the actual failure only showed up once
+patches started hitting the real API server:
+
+- `k8s::patch_secret_key` (against `neutron-etc`) succeeded on the first
+  real attempt -- `mechanism_drivers = openvswitch,ovn,unifi` was
+  confirmed live in the Secret.
+- `k8s::patch_configmap_key` (against `neutron-bin`) failed immediately
+  with a 409: `Apply failed with 1 conflict: conflict with "helm" using
+  v1: .data.neutron-server.sh`. Root cause: every field on every asset
+  this controller touches is already owned by field manager `"helm"` from
+  the original `helm install`, and `PatchParams::apply(...)` without
+  `.force()` refuses to take a field away from another manager. The Secret
+  patch happened to succeed anyway only because it goes through `stringData`
+  (a field Helm's own Secret creation never populated, so no ownership
+  collision existed there) while the ConfigMap patch goes through `data`
+  directly (the same field path Helm used) -- an accidental asymmetry, not
+  a deliberate design difference. Fixed by adding `.force()` to every
+  `Patch::Apply` call in `k8s.rs` -- see that module's doc comment for the
+  full rationale (this is the actual point of the controller, not a
+  workaround).
+- **Real-world validation of the "safe partial failure" design property**:
+  the repair aborted after step 1 with step 4 (the Deployment injection
+  patch, which is what actually triggers a rollout) never reached. The
+  live `neutron-server` pod was completely unaffected -- confirmed still
+  `Running`, unchanged `AGE`, throughout. This is exactly the behavior
+  "Repair logic" above was designed around: a mid-repair failure leaves
+  static assets partially updated but triggers no rollout, so nothing
+  user-facing breaks until the *last* step (the one that forces a
+  rollout) actually succeeds.
+- Also discovered along the way: `helm upgrade` from a stale local chart
+  checkout on the deploying host silently used an outdated template
+  (missing the not-yet-`git pull`ed `extraConfigSecretRef` support) --
+  not a guardian bug, but a real deployment-process gotcha worth
+  remembering: always re-pull a git-cloned chart checkout immediately
+  before `helm upgrade`, not just once at the start of a session.
+- Also discovered: a plain `helm upgrade` that only changes a Secret's
+  *content* (not the Deployment's `spec.template`) does not restart pods
+  that already have that Secret mounted as a plain volume (non-`subPath`)
+  -- kubelet live-syncs the file on disk, but a process that already read
+  it into memory at startup (like this guardian reading `drivers.yaml`)
+  never sees the update without an explicit `kubectl rollout restart`.
+  Only relevant to *this* guardian's own drivers-config Secret, not to its
+  patches against `neutron-etc`/`neutron-bin` (those are read fresh every
+  reconcile tick).
+
+Next: re-deploy with the `.force()` fix and confirm a full real repair
+succeeds end-to-end, including the post-repair present-check.
+
+**Still open:**
+- Confirm the wheel-cache download Job actually succeeds against the real
+  `pf9-neutron` image (untested until a repair reaches that step) --
+  specifically, whether `pip` is available in that image and whether it
+  has outbound PyPI access.
+- Confirm the post-repair present-check (`mechanism_drivers` line +
+  `python3 -c "import unifi_ml2_driver"`) actually passes once the
+  initContainer has had a chance to run.
