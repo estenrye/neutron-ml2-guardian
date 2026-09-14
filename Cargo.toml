@@ -1,0 +1,32 @@
+[package]
+name = "neutron-ml2-guardian"
+version = "0.1.0"
+edition = "2021"
+description = "Self-healing controller that keeps one or more third-party Neutron ML2 mechanism drivers installed and configured on a Platform9 Private Cloud Director neutron-server Helm release, without a custom container image."
+license = "Apache-2.0"
+
+[[bin]]
+name = "neutron-ml2-guardian"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7" }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+kube = { version = "0.95", features = ["client", "runtime", "rustls-tls", "ws"], default-features = false }
+k8s-openapi = { version = "0.23", features = ["v1_29"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "1"
+anyhow = "1"
+regex = "1"
+opentelemetry = { version = "0.32.0", features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "trace", "metrics", "logs"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs", "tls-roots"] }
+tracing-opentelemetry = "0.33.0"
+opentelemetry-appender-tracing = "0.32.0"
+
+[dev-dependencies]

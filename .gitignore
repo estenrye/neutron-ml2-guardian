@@ -1,0 +1,9 @@
+/target
+.env
+.DS_Store
+.helm-dist
+
+# Real per-environment driver secrets (see values.yaml's ml2Drivers example
+# and secret-drivers.yaml's warning about extraConfigSecretData) -- keep
+# any real values overlay containing credentials out of version control.
+values.secrets.yaml

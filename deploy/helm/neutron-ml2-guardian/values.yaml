@@ -1,0 +1,74 @@
+# Default values for neutron-ml2-guardian.
+# See docs/specs/2026-09-13-neutron-ml2-guardian-design.md for the full
+# design this chart implements.
+
+image:
+  repository: docker.io/estenrye/neutron-ml2-guardian
+  tag: "" # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# The guardian runs in its own namespace (wherever this release is
+# installed) but reads/patches resources in targetNamespace via a
+# cross-namespace Role+RoleBinding -- see templates/role.yaml. Keeping the
+# guardian's own RBAC footprint auditable separately from the target
+# namespace's own service accounts is the point; see the design doc's
+# "Deployment shape" section.
+targetNamespace: pcd
+
+# The Helm release and Deployment this guardian keeps repaired. Not
+# hardcoded anywhere in the controller itself -- these are real config, per
+# the design doc's insistence that "pcd"/"neutron"/"neutron-server" are this
+# cluster's naming, not Neutron/PCD constants.
+helmReleaseName: neutron
+deploymentName: neutron-server
+
+reconcileIntervalSecs: 300
+
+# Shared ReadWriteMany PVC for the wheel cache. Needs a storage class that
+# actually supports RWX (NFS-backed is the common home-lab answer, e.g. the
+# same TrueNAS-backed storage class used elsewhere in this environment) --
+# not yet defaulted to one here since that's environment-specific.
+wheelcache:
+  pvcName: neutron-ml2-wheelcache
+  storageClassName: ""
+  size: 512Mi
+
+# The drivers this guardian keeps present. Each entry:
+#   name:                        the mechanism_drivers/stevedore name
+#   pipPackage:                  pip-installable package spec
+#   importModule:                top-level Python module to test-import
+#   extraConfigSecretData:       (optional) opaque INI content this driver
+#                                needs, written verbatim into a per-driver
+#                                Secret and mounted as an extra
+#                                --config-file. Never parsed by the guardian.
+#   soleDriver:                  (optional, default false) set only for a
+#                                driver that cannot coexist with other
+#                                soleDriver-flagged entries.
+#
+# See docs/specs/2026-09-13-neutron-ml2-guardian-design.md's "Generalizing"
+# section. Empty by default -- a real deployment of this chart must set at
+# least one driver via its own values file/overlay.
+ml2Drivers: []
+# Example:
+# ml2Drivers:
+#   - name: unifi
+#     pipPackage: unifi-ml2-driver
+#     importModule: unifi_ml2_driver
+#     extraConfigSecretData: |
+#       [unifi]
+#       controller_url = https://192.168.1.1
+#       api_key = REPLACE_ME
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+# OTLP export is opt-in, same convention as pdns4-shim -- unset means stdout
+# JSON logging only.
+otel:
+  exporterEndpoint: ""
+
+logLevel: info

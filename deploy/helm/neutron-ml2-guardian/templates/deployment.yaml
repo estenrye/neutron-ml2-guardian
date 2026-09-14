@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Release.Name }}
+      annotations:
+        # Picked up automatically by the Prometheus already running in
+        # .Values.targetNamespace, per the design doc's "observability
+        # rides on PCD's own stack" note -- adjust/remove if that cluster's
+        # Prometheus uses PodMonitor/ServiceMonitor discovery instead of
+        # annotation-based scraping.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ .Release.Name }}
+      containers:
+        - name: guardian
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: TARGET_NAMESPACE
+              value: {{ .Values.targetNamespace | quote }}
+            - name: HELM_RELEASE_NAME
+              value: {{ .Values.helmReleaseName | quote }}
+            - name: DEPLOYMENT_NAME
+              value: {{ .Values.deploymentName | quote }}
+            - name: WHEELCACHE_PVC_NAME
+              value: {{ .Values.wheelcache.pvcName | quote }}
+            - name: RECONCILE_INTERVAL_SECS
+              value: {{ .Values.reconcileIntervalSecs | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            {{- with .Values.otel.exporterEndpoint }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: drivers-config
+              mountPath: /etc/neutron-ml2-guardian
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: drivers-config
+          secret:
+            secretName: {{ .Release.Name }}-drivers

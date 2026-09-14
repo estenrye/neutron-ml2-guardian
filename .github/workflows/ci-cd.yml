@@ -1,0 +1,118 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --locked --all-targets
+
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+      - run: cargo test --locked
+
+  # Builds a linux/amd64 + linux/arm64 image on every push/PR (validating
+  # the Dockerfile), and pushes it to Docker Hub except on PRs. Tag scheme:
+  # branch pushes to main get a `main` tag; version tags (v1.2.3) get
+  # `1.2.3`, `1.2`, `1` and `latest`.
+  docker:
+    name: Build & push Docker image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/estenrye/neutron-ml2-guardian
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Packages and publishes the Helm chart as an OCI artifact to Docker Hub
+  # (oci://registry-1.docker.io/estenrye), gated to real releases only --
+  # chart versions should track app releases, not every branch push.
+  helm:
+    name: Package & push Helm chart
+    needs: docker
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: |
+          helm lint deploy/helm/neutron-ml2-guardian \
+            --set 'ml2Drivers[0].name=lint-placeholder' \
+            --set 'ml2Drivers[0].pipPackage=lint-placeholder' \
+            --set 'ml2Drivers[0].importModule=lint_placeholder'
+
+      - name: Package chart
+        env:
+          CHART_VERSION: ${{ github.ref_name }}
+        run: |
+          chart_version="${CHART_VERSION#v}"
+          helm package deploy/helm/neutron-ml2-guardian \
+            --version "$chart_version" \
+            --app-version "$chart_version" \
+            --destination .helm-dist
+
+      - name: Push chart to Docker Hub (OCI)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          helm registry login registry-1.docker.io \
+            --username "$DOCKERHUB_USERNAME" \
+            --password "$DOCKERHUB_TOKEN"
+          helm push .helm-dist/*.tgz oci://registry-1.docker.io/estenrye
