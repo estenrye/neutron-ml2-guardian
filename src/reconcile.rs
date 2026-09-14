@@ -59,6 +59,19 @@ const ML2_CONF_FILE_FLAG_LINE: &str = "        --config-file /etc/neutron/plugin
 /// investigating the degraded metric/log).
 const MAX_CONSECUTIVE_REPAIR_FAILURES: u32 = 3;
 
+/// A repair's own `apply_injection_patch` triggers a Deployment rollout;
+/// checking immediately after `repair()` returns always raced that rollout
+/// live -- the old pod briefly still reports Ready while Terminating, then
+/// there's a real gap with no Ready pod at all before the new one comes up
+/// -- producing a false "degraded" on every single successful repair, not
+/// just an occasional flake. These bound how long the post-repair check
+/// waits for a genuinely Ready replacement pod before accepting the
+/// (possibly still-failing) result: observed real rollouts settle within
+/// ~25-30s, so 6 attempts at 5s apart gives real repairs room to finish
+/// while still bounding a truly stuck rollout.
+const POST_REPAIR_CHECK_RETRIES: u32 = 6;
+const POST_REPAIR_CHECK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
 // Confirmed 2026-09-14 against the live cluster (`kubectl get deployment
 // neutron-server -n pcd -o jsonpath='{.spec.template.spec.containers[*].name}'`)
 // -- hyphenated, not the "neutron_server" underscore form used by the
@@ -149,7 +162,19 @@ pub async fn run_once(
                                 continue;
                             }
                         };
-                        match check_present(cfg, k8s, &post_repair_deployment, driver).await {
+                        let mut result =
+                            check_present(cfg, k8s, &post_repair_deployment, driver).await;
+                        for _ in 0..POST_REPAIR_CHECK_RETRIES {
+                            if matches!(result, CheckResult::Present) {
+                                break;
+                            }
+                            tokio::time::sleep(POST_REPAIR_CHECK_RETRY_DELAY).await;
+                            let Ok(d) = k8s.get_deployment(&cfg.deployment_name).await else {
+                                continue;
+                            };
+                            result = check_present(cfg, k8s, &d, driver).await;
+                        }
+                        match result {
                             CheckResult::Present => {
                                 state.consecutive_failures.remove(&driver.name);
                                 tracing::info!(driver = %driver.name, "repair confirmed");

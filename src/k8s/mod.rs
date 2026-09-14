@@ -298,6 +298,15 @@ impl K8s {
             .await?;
 
         for pod in list.items {
+            // A pod mid-rollout replacement has `deletionTimestamp` set but
+            // can still report `Ready=True` for a while (Kubernetes doesn't
+            // flip that automatically on delete) -- confirmed live: exec
+            // into one is rejected with 403 Forbidden, which surfaced as a
+            // spurious "degraded" post-repair check immediately after a
+            // repair's own injection patch had just triggered a rollout.
+            if pod.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
             let ready = pod
                 .status
                 .as_ref()
