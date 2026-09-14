@@ -55,15 +55,16 @@ ml2Drivers:
     importModule: unifi_ml2_driver     # top-level module to test-import
     extraConfigSecretData: |           # opaque -- never parsed by the guardian
       [unifi]
-      controller_url = https://192.168.1.1
-      api_key = REPLACE_ME
+      host = 192.168.1.1
+      apikey = REPLACE_ME
+      site = default
 ```
 
 Add more entries to guard multiple drivers with the same controller. See
 `deploy/helm/neutron-ml2-guardian/values.yaml` for the full schema
 (`soleDriver`, wheel cache sizing, reconcile interval, etc.).
 
-Keep any values file containing real credentials (like the `api_key` above)
+Keep any values file containing real credentials (like the `apikey` above)
 out of plaintext version control -- `.gitignore` already excludes
 `values.secrets.yaml` as a convention for this.
 
@@ -86,13 +87,26 @@ This installs:
   (needs a storage class that actually supports RWX -- NFS-backed is the
   common answer; set `wheelcache.storageClassName`).
 
+By default (`dryRun: true`) it will not actually touch the target release --
+it logs exactly what a repair would do (the computed `mechanism_drivers`
+value, the intended Deployment patch, the wheel-cache refresh) without
+calling `helm upgrade`, patching anything, or creating a Job. Watch a few
+reconcile cycles' logs, confirm they look right, then deliberately set
+`dryRun: false` (`--set dryRun=false` or in your values file) to let it
+actually repair. This default exists specifically because the RBAC grant
+above is real power and shouldn't run unattended before you've seen what it
+intends to do.
+
 ## Status
 
 **First-pass scaffold, not yet run against a real cluster.** It builds
 clean (`cargo check`, `cargo clippy -- -D warnings`) and the Helm chart
-lints/renders, but see the design doc's "Status" section for the concrete
-gaps (chart-reference resolution for `helm upgrade`, `PYTHONPATH`
-verification, no test suite yet) before trusting this in production.
+lints/renders. `PYTHONPATH` propagation and the real container name have
+since been verified against the live cluster (see the design doc's
+"Status" section) and a `dryRun`-default safety mode has been added, but
+the `helm upgrade` chart-reference resolution is still a placeholder and
+there's no test suite yet -- see that section for the full list before
+trusting this in production.
 
 ## Building and running
 

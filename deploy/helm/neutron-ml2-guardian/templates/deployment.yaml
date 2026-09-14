@@ -43,6 +43,8 @@ spec:
               value: {{ .Values.wheelcache.pvcName | quote }}
             - name: RECONCILE_INTERVAL_SECS
               value: {{ .Values.reconcileIntervalSecs | quote }}
+            - name: DRY_RUN
+              value: {{ .Values.dryRun | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- with .Values.otel.exporterEndpoint }}

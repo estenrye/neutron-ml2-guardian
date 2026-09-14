@@ -1,6 +1,6 @@
 //! Keeps `/wheelcache/<driver>` current: a `pip download` run in a
 //! short-lived Job using **the same image as the currently-observed
-//! `neutron_server` container** (so downloaded wheels match its Python
+//! `neutron-server` container** (so downloaded wheels match its Python
 //! ABI), off the neutron pod's own startup critical path -- see the design
 //! doc's rationale for why this can't just be a live `pip install` inside
 //! the injected initContainer itself.
@@ -33,7 +33,7 @@ use crate::error::{GuardianError, GuardianResult};
 const WHEELCACHE_ROOT: &str = "/wheelcache";
 
 /// Whether a driver's cached wheel set needs to be re-downloaded whenever
-/// the observed `neutron_server` image's Python version changes, or is safe
+/// the observed `neutron-server` image's Python version changes, or is safe
 /// to reuse forever. Derived empirically from wheel filename tags after a
 /// download -- never declared by the operator, see the design doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

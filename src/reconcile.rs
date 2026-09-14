@@ -23,7 +23,13 @@ use crate::{helm, metrics, wheelcache};
 /// investigating the degraded metric/log).
 const MAX_CONSECUTIVE_REPAIR_FAILURES: u32 = 3;
 
-const MAIN_CONTAINER_NAME: &str = "neutron_server";
+// Confirmed 2026-09-14 against the live cluster (`kubectl get deployment
+// neutron-server -n pcd -o jsonpath='{.spec.template.spec.containers[*].name}'`)
+// -- hyphenated, not the "neutron_server" underscore form used by the
+// chart's own `images.tags.neutron_server` *values* key naming convention.
+// Those are two different things (a Helm values path vs. a container
+// name) and it's an easy mix-up -- this was originally wrong in this file.
+const MAIN_CONTAINER_NAME: &str = "neutron-server";
 const ML2_CONF_PATH: &str = "/etc/neutron/plugins/ml2/ml2_conf.ini";
 
 #[derive(Default)]
@@ -66,6 +72,23 @@ pub async fn run_once(
                 // reasons unrelated to installation.
                 tracing::error!(driver = %driver.name, reason, "driver present but degraded, not attempting repair");
                 metrics::record_present(&driver.name, false);
+            }
+            CheckResult::Absent if cfg.dry_run => {
+                metrics::record_present(&driver.name, false);
+                // Intentionally does not call repair() at all -- no
+                // helm upgrade, no Deployment patch, no Job creation. See
+                // Config::dry_run's doc comment and the design doc's
+                // "Status" section: this is the safe default until an
+                // operator deliberately sets DRY_RUN=false.
+                match describe_intended_repair(cfg, driver).await {
+                    Ok(description) => {
+                        tracing::warn!(driver = %driver.name, %description, "DRY RUN: driver absent, repair skipped (would apply the above)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(driver = %driver.name, error = %e, "DRY RUN: driver absent, and computing the intended repair also failed (this read-only failure would likely also fail a real repair)");
+                    }
+                }
+                metrics::record_repair_dry_run(&driver.name);
             }
             CheckResult::Absent => {
                 metrics::record_present(&driver.name, false);
@@ -185,6 +208,37 @@ fn mechanism_drivers_line_includes(ml2_conf: &str, driver_name: &str) -> bool {
                 .any(|d| d.trim() == driver_name)
         })
         .unwrap_or(false)
+}
+
+/// Computes (read-only -- one `helm get values` call, no mutation) a
+/// human-readable description of what `repair` would do, for `DRY_RUN`
+/// mode. Deliberately mirrors `repair`'s own logic for the mechanism_drivers
+/// merge so the dry-run log line reflects the real computed value, not a
+/// guess.
+async fn describe_intended_repair(cfg: &Config, driver: &DriverSpec) -> GuardianResult<String> {
+    let values = helm::get_values(&cfg.target_namespace, &cfg.helm_release_name).await?;
+    let current = helm::mechanism_drivers_value(&values).unwrap_or_default();
+    let mut drivers: Vec<&str> = current
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !drivers.contains(&driver.name.as_str()) {
+        drivers.push(&driver.name);
+    }
+    let new_value = drivers.join(",");
+
+    Ok(format!(
+        "helm upgrade {} --set conf.neutron.ml2_conf.ml2.mechanism_drivers={new_value}; \
+         write extra-config secret: {}; \
+         refresh wheel cache for pip package {}; \
+         patch deployment {} to inject initContainer {} + PYTHONPATH",
+        cfg.helm_release_name,
+        !driver.extra_config_secret_data.is_empty(),
+        driver.pip_package,
+        cfg.deployment_name,
+        crate::k8s::INJECTOR_CONTAINER_NAME,
+    ))
 }
 
 async fn repair(

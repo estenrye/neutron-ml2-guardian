@@ -87,6 +87,18 @@ pub struct Config {
     /// How often the reconcile loop runs.
     pub reconcile_interval_secs: u64,
 
+    /// When true (the default), a detected-absent driver is logged with
+    /// exactly what repair *would* do (the computed `mechanism_drivers`
+    /// value, the injection patch, the wheel-cache refresh) without
+    /// actually calling `helm upgrade`, patching the Deployment, or
+    /// creating the download Job. Given the guardian's RBAC grant is
+    /// effectively "can run `helm upgrade neutron` and rewrite its
+    /// Deployment's pod spec," defaulting to dry-run means a fresh
+    /// deployment of this chart is safe to install and observe before
+    /// anyone deliberately flips it to `false`. See the design doc's
+    /// "Status" section.
+    pub dry_run: bool,
+
     /// The drivers this guardian is responsible for keeping present.
     pub drivers: Vec<DriverSpec>,
 }
@@ -105,6 +117,12 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
+        // Defaults to safe (true): an operator must deliberately opt in to
+        // letting this controller actually mutate the target release.
+        let dry_run = env::var("DRY_RUN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(true);
 
         let drivers_file = env::var("DRIVERS_CONFIG_PATH")
             .unwrap_or_else(|_| "/etc/neutron-ml2-guardian/drivers.yaml".to_string());
@@ -136,6 +154,7 @@ impl Config {
             deployment_name,
             wheelcache_pvc_name,
             reconcile_interval_secs,
+            dry_run,
             drivers,
         })
     }

@@ -69,7 +69,7 @@ impl K8s {
             .map_err(GuardianError::Kube)
     }
 
-    /// The image reference of the Deployment's *main* `neutron_server`
+    /// The image reference of the Deployment's *main* `neutron-server`
     /// container -- deliberately read live off the Deployment rather than
     /// configured anywhere, so the injector always matches whatever image
     /// PCD currently ships (the whole point of not pinning a custom image).

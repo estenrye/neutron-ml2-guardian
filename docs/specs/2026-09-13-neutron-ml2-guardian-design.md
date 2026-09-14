@@ -73,16 +73,17 @@ Implemented in `src/reconcile.rs::check_present`.
   spec, never hardcoded (`src/k8s/mod.rs::main_container_image`). It runs
   `pip install --no-index --find-links=/wheelcache/<driver> ...
   --target=/opt/ml2-plugins <pip packages>` into a shared `emptyDir`.
-- The main `neutron_server` container gets that `emptyDir` mounted and a
-  `PYTHONPATH` addition pointing at it. `pf9-neutron`'s entrypoint is very
-  likely a standard setuptools `console_scripts` shebang script (the venv
-  was located at `/var/lib/openstack/lib/python3.10/site-packages` during
-  the original investigation), which should honor `PYTHONPATH` normally --
-  **this needs one empirical check against the real cluster before relying
-  on it in production**; if it doesn't take effect, the documented fallback
-  is mounting the emptyDir as a subdirectory *inside* the real
-  site-packages tree plus a `.pth` file pointing at it (the standard
-  CPython `site` module mechanism for extending `sys.path`).
+- The main `neutron-server` container gets that `emptyDir` mounted and a
+  `PYTHONPATH` addition pointing at it. **Confirmed 2026-09-14 against the
+  live cluster**: `neutron-server`'s entrypoint
+  (`/var/lib/openstack/bin/neutron-server`) is exactly the plain setuptools
+  `console_scripts` shebang script this design assumed
+  (`#!/var/lib/openstack/bin/python3`, no `-S`/isolated-mode flags), and an
+  `env PYTHONPATH=... python3 -c "import sys; print(sys.path)"` exec test
+  against the real running pod confirmed the path shows up in `sys.path` as
+  expected. The `.pth`-file fallback described below is therefore not
+  needed for this image and is kept only as a documented contingency in
+  case a future PCD base image changes this.
 - `--no-index --find-links`, never a live `pip install`, is the important
   detail: it keeps the neutron-server pod's *startup* path fully offline. A
   pod restart is not rare (node reboot, OOM, rescheduling, an unrelated
@@ -223,14 +224,46 @@ rather than silently producing a broken `mechanism_drivers` list.
 
 This is a first-pass scaffold: it builds cleanly (`cargo check`/`cargo
 clippy -- -D warnings` both pass) and the Helm chart lints/renders, but it
-has **not been run against a real cluster yet**. Known gaps before that's
-safe to try:
+has **not been run against a real cluster yet** (i.e. it has never actually
+performed a repair).
 
-- The `helm upgrade` chart-reference resolution (see "Repair logic" above).
-- Verifying `PYTHONPATH` actually takes effect in the real `pf9-neutron`
-  entrypoint (vs. needing the `.pth`-file fallback).
-- Verifying `networking-unifi`'s actual registered stevedore name and
-  import module.
+**Verified 2026-09-14, against the live cluster or `networking-unifi`'s own
+source:**
+- `PYTHONPATH` propagation through `neutron-server`'s real entrypoint --
+  confirmed working, no `.pth`-file fallback needed (see "Runtime driver
+  injection" above).
+- The real main container name is `neutron-server` (hyphenated) -- an
+  actual bug in the first-pass scaffold (`MAIN_CONTAINER_NAME` was
+  `"neutron_server"`, confusing the Helm chart's own
+  `images.tags.neutron_server` *values key* naming convention with the
+  container name in the rendered pod spec), now fixed.
+- `networking-unifi`'s registered entry point: `unifi =
+  "unifi_ml2_driver.unifi_mech:UnifiMechDriver"` under
+  `neutron.ml2.mechanism_drivers` -- confirms `name: unifi` /
+  `importModule: unifi_ml2_driver` in the values example were already
+  correct.
+- `networking-unifi`'s real `[unifi]` config schema (from
+  `unifi_ml2_driver/config.py`): `host`, `port` (default 8443), `apikey`
+  (preferred -- if set, `username`/`password` are ignored), `username`,
+  `password`, `site` (default `"default"`), `verify_ssl`, `cafile`, plus
+  driver-behavior options (`use_all_networks_for_trunk`,
+  `enable_port_security`, `enable_qos`, DNS integration, etc.). It talks to
+  the UniFi controller's own API (there's a `unifi_api.py` module), not raw
+  per-switch SSH/Netmiko -- the `devstack/plugin.sh` NGS/Netmiko-flavored
+  variables in that repo appear to be inherited scaffolding from its
+  `networking-generic-switch` ancestry rather than the real runtime path.
+  `values.yaml`'s example has been corrected to this real schema.
+
+**Still open before this is safe to actually run:**
+- The `helm upgrade` chart-reference resolution (see "Repair logic" above)
+  -- still a placeholder.
 - A real Prometheus text-format `/metrics` handler (OTLP export works
   today; the annotated-scrape path doesn't yet).
-- No test suite yet.
+- No test suite yet -- `wheelcache::classify` and the driver-config
+  YAML/`mechanism_drivers`-string parsing are pure functions and should be
+  the first ones covered, since they need no live cluster.
+- **A dry-run mode.** Given the guardian's RBAC grant is real ("can run
+  `helm upgrade neutron` and rewrite its Deployment's pod spec"), the first
+  run against a real cluster should log its intended `helm upgrade`
+  args/patch instead of executing them, so one cycle's output can be
+  reviewed before enabling fully-automatic repair. Not yet implemented.

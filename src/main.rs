@@ -25,8 +25,12 @@ async fn main() -> anyhow::Result<()> {
         deployment = %config.deployment_name,
         drivers = ?config.drivers.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
         reconcile_interval_secs = config.reconcile_interval_secs,
+        dry_run = config.dry_run,
         "starting neutron-ml2-guardian"
     );
+    if config.dry_run {
+        tracing::warn!("DRY_RUN=true: repairs will be logged but not applied -- set DRY_RUN=false to enable real repairs");
+    }
 
     let client = Client::try_default().await?;
     let k8s = K8s::try_default(&config.target_namespace).await?;

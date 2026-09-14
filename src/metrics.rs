@@ -64,6 +64,20 @@ pub fn record_repair(driver: &str, applied: bool) {
     );
 }
 
+/// A repair that was computed but deliberately not applied (`DRY_RUN=true`,
+/// the default -- see `Config::dry_run`). Distinct from `record_repair`'s
+/// "skipped" outcome, which means "nothing needed doing" rather than
+/// "something needed doing but was withheld."
+pub fn record_repair_dry_run(driver: &str) {
+    INSTRUMENTS.repairs_total.add(
+        1,
+        &[
+            KeyValue::new("driver", driver.to_string()),
+            KeyValue::new("outcome", "dry_run"),
+        ],
+    );
+}
+
 pub fn record_repair_failure(driver: &str) {
     INSTRUMENTS
         .repair_failures_total
