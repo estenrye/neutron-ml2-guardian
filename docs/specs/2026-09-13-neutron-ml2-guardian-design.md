@@ -184,11 +184,13 @@ exercised against the cluster with `DRY_RUN=false`.
 
 ## Safety rails
 
-- **Backoff, don't repair-loop.** After
-  `MAX_CONSECUTIVE_REPAIR_FAILURES` (3, in `src/reconcile.rs`) failed
-  repairs for a driver, the guardian stops attempting further repairs for
-  it until the process restarts, and surfaces a sustained "degraded" signal
-  instead of repeatedly restarting a broken deployment.
+- **Backoff, don't repair-loop.** After a failed repair for a driver, the
+  guardian waits an exponentially growing delay before trying again
+  (`backoff_delay` in `src/reconcile.rs`: 5 min, 10, 20, ... capped at 1
+  hour) and surfaces a sustained "degraded" signal instead of repeatedly
+  restarting a broken deployment. (Originally a hard stop after 3 failures
+  until the process restarted; changed in 0.1.3 because a guardian fixed by
+  a new release never recovered on its own -- see "PCD 2026.8" below.)
 - **Least-privilege, cross-namespace RBAC.** A `Role` (not `ClusterRole`)
   scoped to the target namespace only (`deploy/helm/.../templates/role.yaml`),
   bound to the guardian's ServiceAccount from its own namespace, and named
@@ -895,6 +897,79 @@ matching `openstack network delete` cleanly removed it from the UDM-SE
 too, confirmed the same way. This is the original goal from the very
 first message in this project's history, working, for real, against
 production hardware.
+
+**PCD 2026.8 upgrade, 2026-10-08: the first real upgrade drift, and two
+more assumptions about PCD's deployment that stopped being true.** The
+reason this controller exists finally happened: PCD upgraded to 2026.8
+(`pf9-neutron:2026.8.1-1862`, still Python 3.10) and the unifi driver
+stopped being injected. Neutron kept running; the driver silently didn't.
+Diagnosed against the live cluster (read-only `kubectl`/`helm` on the PCD
+VM), it was three separate things, found one after another:
+
+1. **`neutron-server.sh` changed shape.** 2026.8 no longer `exec`s
+   `neutron-server --config-file ... \`; it builds a `confs` string and
+   `exec`s uWSGI (`--pyargv " $confs "`). `add_config_dir_flag`'s exact-line
+   anchor no longer matched, returned an error, and -- because that edit
+   ran before the wheel refresh and the injection patch, with `?` -- aborted
+   the whole repair every 5 minutes. The cluster was left half-repaired:
+   `unifi` already in `mechanism_drivers` (step 1 had run), the injector
+   initContainer present, but `PYTHONPATH` missing from the main container,
+   so `import unifi_ml2_driver` failed, and the extra config was never
+   loaded. After 3 failures the old backoff gave up permanently.
+2. **A guardian-triggered rollout then took neutron-server down.** Once
+   the repair got through, its rollout (1 replica, `maxUnavailable: 1`)
+   terminated the old pod and the new one sat in `Init:0/3` forever: PCD's
+   own `init` container (`kubernetes-entrypoint`) waits on
+   `DEPENDENCY_JOBS=neutron-db-sync,neutron-ks-user,neutron-ks-endpoints,
+   neutron-rabbit-init`, one-shot Helm-hook Jobs that are deleted after
+   PCD's upgrade finishes. Every new pod from then on -- not just the
+   guardian's -- would hang. Recovered by hand by patching that env var to
+   empty (strategic merge on the `init` container); the driver then loaded.
+3. **The post-repair check gave a false "degraded".** It waited 30s for a
+   Ready pod; with the injector pip-installing ~50 wheels that was never
+   enough, so a perfectly good repair was logged as failed.
+
+Fixes, shipped as 0.1.3 and 0.1.4:
+
+- `add_config_dir_flag`/`remove_config_dir_flag` handle both layouts: the
+  legacy `exec neutron-server \` anchor and the 2026.8
+  `confs+=" --config-file .../ml2_conf.ini"` line (a sibling
+  `confs+=" --config-dir ..."` is inserted after it). Still refuses to
+  guess if neither matches; tests use the real 2026.8 script as a fixture.
+- A failed `--config-dir` edit is now logged loudly and no longer aborts
+  the repair: the wheel refresh and injection don't depend on it, so a
+  future script change costs the driver's extra config, not the driver.
+- Backoff is exponential (5 min to 1 h) instead of permanent.
+- `K8s::injection_is_current`: the injection counts as missing (and is
+  repaired) if the main container lost `PYTHONPATH`, if the injector's
+  image differs from the main container's image (PCD changed the image
+  under a stale wheel cache), or if `DEPENDENCY_JOBS` is non-empty again.
+- The injection patch sets the `init` container's `DEPENDENCY_JOBS` to
+  empty -- the guardian only starts pods long after those Jobs ran. Helm
+  restoring it on a real upgrade is now detected as drift and re-healed.
+- Post-repair wait raised from 30s to 5 min (60 x 5s).
+
+**Verified 2026-10-09** on the live cluster after upgrading the guardian
+to 0.1.4 (Helm revision 91): `neutron-server` `3/3 Running`, zero
+restarts; `import unifi_ml2_driver` succeeds in the main container; the
+driver's own logs show both subnets syncing to the UDM-SE every 5 minutes
+(VLAN 1000 and VLAN 1179, the latter assigned to its firewall zone);
+the operator confirmed the driver modifies UniFi. The guardian logged
+nothing after startup across ~4 reconcile ticks (it only logs on a repair
+or a failure), i.e. it found the driver `Present` each time.
+
+**Known gaps left open.** (a) The first recovery needed a manual patch,
+since a not-yet-upgraded guardian can't fix a rollout it triggers itself;
+a future version could make the injection safe to apply to a pod that has
+never started. (b) `DRY_RUN` revert doesn't restore the original
+`DEPENDENCY_JOBS` value (not recorded anywhere); a real PCD upgrade or
+Helm re-render does. (c) A driver that is listed but fails to import while
+the injection looks current is still `Degraded` with no repair, by design.
+(d) The guardian's own `DEPENDENCY_JOBS` init-container patch has not run
+against the live cluster yet: the recovery used an equivalent manual
+`kubectl patch`, and the 0.1.4 guardian found the driver already `Present`
+so never repaired. It was not server-side dry-run validated either, so
+treat the first real repair after a PCD upgrade as its actual test.
 
 ## Automated revert: `DRY_RUN=true` now means "zero footprint," not just "don't touch anything"
 
