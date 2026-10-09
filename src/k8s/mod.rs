@@ -303,6 +303,36 @@ impl K8s {
             .unwrap_or(false)
     }
 
+    /// True if the injection is both wired up and built for the image now
+    /// running: the injector initContainer uses the same image as the main
+    /// container (it's set from it at apply time, so a mismatch means PCD
+    /// changed the image since -- the wheel cache and `--target` install are
+    /// stale), and the main container still has `PYTHONPATH` pointing at the
+    /// plugin directory (a Helm re-render drops it while leaving the
+    /// initContainer in place).
+    pub fn injection_is_current(deployment: &Deployment, main_container_name: &str) -> bool {
+        let Some(pod_spec) = deployment
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+        else {
+            return false;
+        };
+        let main = pod_spec.containers.iter().find(|c| c.name == main_container_name);
+        let injector = pod_spec
+            .init_containers
+            .as_ref()
+            .and_then(|cs| cs.iter().find(|c| c.name == INJECTOR_CONTAINER_NAME));
+        let (Some(main), Some(injector)) = (main, injector) else {
+            return false;
+        };
+        let env_ok = main.env.as_ref().is_some_and(|env| {
+            env.iter()
+                .any(|e| e.name == "PYTHONPATH" && e.value.as_deref() == Some(PLUGIN_MOUNT_PATH))
+        });
+        env_ok && main.image == injector.image
+    }
+
     /// Finds one `Ready` pod backing the given Deployment (by matching the
     /// Deployment's own selector labels), for exec-based checks. Returns
     /// `None` if nothing is Ready yet -- callers should treat that as

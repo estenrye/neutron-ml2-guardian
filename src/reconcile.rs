@@ -6,7 +6,7 @@
 //! rationale behind every decision in this module.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kube::Client;
 
@@ -61,14 +61,27 @@ const NEUTRON_SERVER_SCRIPT_KEY: &str = "neutron-server.sh";
 /// flag risks corrupting how Neutron starts at all -- better to fail loudly
 /// (see `add_config_dir_flag`) than to guess.
 const ML2_CONF_FILE_FLAG_LINE: &str = "        --config-file /etc/neutron/plugins/ml2/ml2_conf.ini";
+/// The 2026.8 equivalent (confirmed live 2026-10-08, `pf9-neutron:2026.8.1-1862`):
+/// the script now builds a `confs` string and `exec`s uWSGI with it via
+/// `--pyargv`, so the ml2 config file is a `confs+=` line, matched by its
+/// trimmed text so indentation changes don't matter.
+const ML2_CONF_CONFS_LINE: &str =
+    "confs+=\" --config-file /etc/neutron/plugins/ml2/ml2_conf.ini\"";
 
-/// After this many consecutive failed repairs for a given driver, stop
-/// attempting further repairs until the process restarts (a deliberate,
-/// simple policy for a first pass -- see the design doc's "backoff, don't
-/// repair-loop" safety rail). A restart is an intentional, visible reset
-/// point (a new pod from a rollout, or an operator restarting it after
-/// investigating the degraded metric/log).
-const MAX_CONSECUTIVE_REPAIR_FAILURES: u32 = 3;
+/// Repair retries back off exponentially (base * 2^(failures-1)) up to this
+/// cap, instead of the original "give up after 3 failures until the pod
+/// restarts" -- which meant a guardian fixed by a new release (or an
+/// upstream fix) never recovered on its own. Still bounded, so a repair
+/// that can't work isn't retried (and a rollout isn't triggered) every tick.
+const REPAIR_BACKOFF_BASE: Duration = Duration::from_secs(300);
+const REPAIR_BACKOFF_MAX: Duration = Duration::from_secs(3600);
+
+fn backoff_delay(failures: u32) -> Duration {
+    let exp = failures.saturating_sub(1).min(16);
+    REPAIR_BACKOFF_BASE
+        .checked_mul(1u32 << exp)
+        .map_or(REPAIR_BACKOFF_MAX, |d| d.min(REPAIR_BACKOFF_MAX))
+}
 
 /// A repair's own `apply_injection_patch` triggers a Deployment rollout;
 /// checking immediately after `repair()` returns always raced that rollout
@@ -94,7 +107,8 @@ const ML2_CONF_PATH: &str = "/etc/neutron/plugins/ml2/ml2_conf.ini";
 
 #[derive(Default)]
 pub struct ReconcileState {
-    consecutive_failures: HashMap<String, u32>,
+    /// driver name -> (consecutive failed repairs, earliest next attempt)
+    consecutive_failures: HashMap<String, (u32, Instant)>,
 }
 
 pub async fn run_once(
@@ -121,9 +135,7 @@ pub async fn run_once(
         let backing_off = state
             .consecutive_failures
             .get(&driver.name)
-            .copied()
-            .unwrap_or(0)
-            >= MAX_CONSECUTIVE_REPAIR_FAILURES;
+            .is_some_and(|(_, next_attempt)| Instant::now() < *next_attempt);
 
         if backing_off {
             tracing::warn!(driver = %driver.name, "backing off further repair attempts after repeated failures");
@@ -211,10 +223,12 @@ pub async fn run_once(
 }
 
 fn bump_failure(state: &mut ReconcileState, driver: &str) {
-    *state
+    let entry = state
         .consecutive_failures
         .entry(driver.to_string())
-        .or_insert(0) += 1;
+        .or_insert((0, Instant::now()));
+    entry.0 += 1;
+    entry.1 = Instant::now() + backoff_delay(entry.0);
 }
 
 enum CheckResult {
@@ -239,6 +253,13 @@ async fn check_present(
 ) -> CheckResult {
     // Layer 1: injection present in the Deployment spec.
     if !K8s::has_injection(deployment) {
+        return CheckResult::Absent;
+    }
+    // Layer 1b: the injection that's there is still wired up and built for
+    // the image now running. A PCD upgrade can leave the initContainer
+    // behind while dropping PYTHONPATH from the main container, or bump the
+    // main image out from under the wheel cache (found live on 2026.8).
+    if !K8s::injection_is_current(deployment, MAIN_CONTAINER_NAME) {
         return CheckResult::Absent;
     }
 
@@ -340,14 +361,17 @@ fn add_driver_to_ml2_conf(ml2_conf: &str, driver_name: &str) -> GuardianResult<S
     Ok(result)
 }
 
-/// Adds a `--config-dir EXTRA_CONF_DIR` line to `neutron-server.sh`'s
-/// `neutron-server` invocation, right after the known last `--config-file`
-/// line -- a one-time change; once present, per-driver extra config never
-/// needs another script edit (see `EXTRA_CONF_DIR`'s doc comment).
-/// Idempotent: a no-op if the flag is already there. Errors (rather than
-/// guessing) if the anchor line isn't found verbatim -- see
-/// `ML2_CONF_FILE_FLAG_LINE`'s doc comment for why that's the safer
-/// failure mode here.
+/// Adds `--config-dir EXTRA_CONF_DIR` to `neutron-server.sh`, right after the
+/// known `ml2_conf.ini` `--config-file` -- a one-time change; once present,
+/// per-driver extra config never needs another script edit (see
+/// `EXTRA_CONF_DIR`'s doc comment). Handles both script layouts seen live:
+/// the pre-2026.8 `exec neutron-server \` form (`ML2_CONF_FILE_FLAG_LINE`,
+/// which gains a ` \` continuation) and the 2026.8 uWSGI form
+/// (`confs+=" --config-file ..."`, `ML2_CONF_CONFS_LINE`, which gets a
+/// sibling `confs+=` line). Idempotent: a no-op if the flag is already
+/// there. Errors (rather than guessing) if neither anchor is found -- see
+/// `ML2_CONF_FILE_FLAG_LINE`'s doc comment for why that's the safer failure
+/// mode here.
 fn add_config_dir_flag(script: &str) -> GuardianResult<String> {
     if script.contains(&format!("--config-dir {EXTRA_CONF_DIR}")) {
         return Ok(script.to_string());
@@ -356,7 +380,13 @@ fn add_config_dir_flag(script: &str) -> GuardianResult<String> {
     let mut found = false;
     let mut out_lines = Vec::new();
     for line in script.lines() {
-        if line == ML2_CONF_FILE_FLAG_LINE {
+        let trimmed = line.trim();
+        let indent = &line[..line.len() - line.trim_start().len()];
+        if !found && trimmed == ML2_CONF_CONFS_LINE {
+            found = true;
+            out_lines.push(line.to_string());
+            out_lines.push(format!("{indent}confs+=\" --config-dir {EXTRA_CONF_DIR}\""));
+        } else if !found && line == ML2_CONF_FILE_FLAG_LINE {
             found = true;
             out_lines.push(format!("{line} \\"));
             out_lines.push(format!("        --config-dir {EXTRA_CONF_DIR}"));
@@ -367,7 +397,7 @@ fn add_config_dir_flag(script: &str) -> GuardianResult<String> {
 
     if !found {
         return Err(GuardianError::Config(format!(
-            "neutron-server.sh didn't contain the expected anchor line ({ML2_CONF_FILE_FLAG_LINE:?}) -- refusing to guess where to insert --config-dir"
+            "neutron-server.sh contained neither expected anchor line ({ML2_CONF_CONFS_LINE:?} or {ML2_CONF_FILE_FLAG_LINE:?}) -- refusing to guess where to insert --config-dir"
         )));
     }
 
@@ -407,20 +437,24 @@ fn remove_driver_from_ml2_conf(ml2_conf: &str, driver_name: &str) -> String {
     result
 }
 
-/// Inverse of `add_config_dir_flag`: removes the `--config-dir
-/// EXTRA_CONF_DIR` line and restores the preceding (anchor) line to its
-/// original form by stripping the trailing `" \\"` continuation
-/// `add_config_dir_flag` gave it. Infallible and idempotent -- a no-op if
-/// the flag isn't present.
+/// Inverse of `add_config_dir_flag`, for both layouts: removes the
+/// `--config-dir EXTRA_CONF_DIR` line (and, for the legacy layout, strips
+/// the `" \\"` continuation the preceding anchor line was given). Infallible
+/// and idempotent -- a no-op if the flag isn't present.
 fn remove_config_dir_flag(script: &str) -> String {
-    let marker = format!("        --config-dir {EXTRA_CONF_DIR}");
-    if !script.contains(&marker) {
+    let legacy = format!("--config-dir {EXTRA_CONF_DIR}");
+    let confs = format!("confs+=\" --config-dir {EXTRA_CONF_DIR}\"");
+    if !script.contains(&legacy) {
         return script.to_string();
     }
 
     let mut out_lines: Vec<String> = Vec::new();
     for line in script.lines() {
-        if line == marker {
+        let trimmed = line.trim();
+        if trimmed == confs {
+            continue;
+        }
+        if trimmed == legacy {
             if let Some(last) = out_lines.last_mut() {
                 if let Some(stripped) = last.strip_suffix(" \\") {
                     *last = stripped.to_string();
@@ -780,18 +814,28 @@ async fn repair(
     //    EXTRA_CONF_DIR at all (a one-time change per script -- see
     //    add_config_dir_flag; harmless/idempotent to re-check every time a
     //    driver with extra config repairs).
+    //    The script edit is best-effort: PCD rewrote this script's shape in
+    //    2026.8 and an unrecognized future shape must cost the extra config
+    //    (loudly), not the whole driver -- the wheel refresh and injection
+    //    below don't depend on it.
     if driver.has_extra_config() {
-        let current_script = k8s
+        match k8s
             .get_configmap_key(NEUTRON_BIN_CONFIGMAP_NAME, NEUTRON_SERVER_SCRIPT_KEY)
-            .await?;
-        let new_script = add_config_dir_flag(&current_script)?;
-        if new_script != current_script {
-            k8s.patch_configmap_key(
-                NEUTRON_BIN_CONFIGMAP_NAME,
-                NEUTRON_SERVER_SCRIPT_KEY,
-                &new_script,
-            )
-            .await?;
+            .await
+            .and_then(|current| add_config_dir_flag(&current).map(|new| (current, new)))
+        {
+            Ok((current, new)) if new != current => {
+                if let Err(e) = k8s
+                    .patch_configmap_key(NEUTRON_BIN_CONFIGMAP_NAME, NEUTRON_SERVER_SCRIPT_KEY, &new)
+                    .await
+                {
+                    tracing::error!(driver = %driver.name, error = %e, "failed to patch --config-dir into neutron-server.sh; driver's extra config will NOT be loaded");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(driver = %driver.name, error = %e, "could not add --config-dir to neutron-server.sh; driver's extra config will NOT be loaded (continuing with the rest of the repair)");
+            }
         }
         k8s.write_driver_config_secret(driver).await?;
     }
@@ -1036,5 +1080,51 @@ function start () {
         let unchanged =
             remove_driver_logger_from_logging_conf(SAMPLE_LOGGING_CONF, "unifi_ml2_driver");
         assert_eq!(unchanged, SAMPLE_LOGGING_CONF);
+    }
+
+    const SAMPLE_2026_8_SERVER_SH: &str = r#"#!/bin/bash
+
+set -ex
+COMMAND="${@:-start}"
+
+function start () {
+  neutron-db-manage --subproject neutron-vpnaas upgrade head 
+  confs="--config-file /etc/neutron/neutron.conf"
+  confs+=" --config-file /tmp/pod-shared/ovn.ini"
+
+  confs+=" --config-file /etc/neutron/plugins/ml2/ml2_conf.ini"
+
+  exec uwsgi --ini /etc/neutron/neutron-api-uwsgi.ini --pyargv " $confs "
+}
+"#;
+
+    #[test]
+    fn add_config_dir_flag_handles_2026_8_uwsgi_layout() {
+        let updated = add_config_dir_flag(SAMPLE_2026_8_SERVER_SH).unwrap();
+        let ml2 = updated.find("ml2_conf.ini").unwrap();
+        let dir = updated.find(&format!("--config-dir {EXTRA_CONF_DIR}")).unwrap();
+        let exec = updated.find("exec uwsgi").unwrap();
+        assert!(ml2 < dir && dir < exec);
+        assert!(updated.contains(&format!("  confs+=\" --config-dir {EXTRA_CONF_DIR}\"\n")));
+    }
+
+    #[test]
+    fn config_dir_flag_2026_8_is_idempotent_and_round_trips() {
+        let once = add_config_dir_flag(SAMPLE_2026_8_SERVER_SH).unwrap();
+        assert_eq!(once, add_config_dir_flag(&once).unwrap());
+        assert_eq!(remove_config_dir_flag(&once), SAMPLE_2026_8_SERVER_SH);
+        assert_eq!(
+            remove_config_dir_flag(SAMPLE_2026_8_SERVER_SH),
+            SAMPLE_2026_8_SERVER_SH
+        );
+    }
+
+    #[test]
+    fn backoff_delay_grows_then_caps() {
+        assert_eq!(backoff_delay(1), Duration::from_secs(300));
+        assert_eq!(backoff_delay(2), Duration::from_secs(600));
+        assert_eq!(backoff_delay(3), Duration::from_secs(1200));
+        assert_eq!(backoff_delay(10), REPAIR_BACKOFF_MAX);
+        assert_eq!(backoff_delay(u32::MAX), REPAIR_BACKOFF_MAX);
     }
 }
