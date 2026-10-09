@@ -50,6 +50,18 @@ const PLUGIN_MOUNT_PATH: &str = "/opt/ml2-plugins";
 const WHEELCACHE_VOLUME_NAME: &str = "ml2-wheelcache";
 const WHEELCACHE_MOUNT_PATH: &str = "/wheelcache";
 
+/// PCD's own dependency-wait initContainer (`kubernetes-entrypoint`) and the
+/// env var listing the one-shot Helm-hook Jobs it blocks on
+/// (`neutron-db-sync,neutron-ks-user,...`). Those Jobs are deleted after PCD's
+/// install/upgrade finishes, after which *every* new `neutron-server` pod --
+/// including the rollout every guardian repair triggers -- hangs forever in
+/// `Init:0/3` resolving Jobs that no longer exist (found live on 2026.8,
+/// 2026-10-08, taking neutron-server down). The guardian only ever starts
+/// pods long after those Jobs ran, so it clears the list; Helm restoring it
+/// on a real upgrade is the normal drift this controller re-heals.
+const DEPENDENCY_INIT_CONTAINER_NAME: &str = "init";
+const DEPENDENCY_JOBS_ENV: &str = "DEPENDENCY_JOBS";
+
 /// Directory oslo.config scans for extra `*.conf` files, once `--config-dir`
 /// is added to `neutron-server.sh` (see `reconcile::add_config_dir_flag`).
 /// Each driver with `has_extra_config()` true gets its own file mounted
@@ -330,7 +342,17 @@ impl K8s {
             env.iter()
                 .any(|e| e.name == "PYTHONPATH" && e.value.as_deref() == Some(PLUGIN_MOUNT_PATH))
         });
-        env_ok && main.image == injector.image
+        // PCD's dependency-wait init must not be blocking on Jobs that no
+        // longer exist (see DEPENDENCY_JOBS_ENV). Absent env/init container
+        // is fine -- only a non-empty list is a problem.
+        let deps_cleared = pod_spec
+            .init_containers
+            .as_ref()
+            .and_then(|cs| cs.iter().find(|c| c.name == DEPENDENCY_INIT_CONTAINER_NAME))
+            .and_then(|c| c.env.as_ref())
+            .and_then(|env| env.iter().find(|e| e.name == DEPENDENCY_JOBS_ENV))
+            .is_none_or(|e| e.value.as_deref().unwrap_or("").is_empty());
+        env_ok && deps_cleared && main.image == injector.image
     }
 
     /// Finds one `Ready` pod backing the given Deployment (by matching the
@@ -589,6 +611,12 @@ impl K8s {
                         "volumes": volumes,
                         "initContainers": [
                             {
+                                "name": DEPENDENCY_INIT_CONTAINER_NAME,
+                                "env": [
+                                    { "name": DEPENDENCY_JOBS_ENV, "value": "" }
+                                ],
+                            },
+                            {
                                 "name": INJECTOR_CONTAINER_NAME,
                                 "image": image,
                                 "command": ["/bin/sh", "-c", install_cmd],
@@ -825,5 +853,46 @@ impl K8s {
             )
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deployment(main_image: &str, injector_image: &str, pythonpath: bool, dep_jobs: &str) -> Deployment {
+        let env = if pythonpath {
+            json!([{ "name": "PYTHONPATH", "value": PLUGIN_MOUNT_PATH }])
+        } else {
+            json!([])
+        };
+        serde_json::from_value(json!({
+            "spec": {
+                "selector": {},
+                "template": { "spec": {
+                    "initContainers": [
+                        { "name": "init", "env": [{ "name": "DEPENDENCY_JOBS", "value": dep_jobs }] },
+                        { "name": INJECTOR_CONTAINER_NAME, "image": injector_image },
+                    ],
+                    "containers": [{ "name": "neutron-server", "image": main_image, "env": env }],
+                }},
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn injection_is_current_when_everything_matches() {
+        assert!(K8s::injection_is_current(&deployment("img:1", "img:1", true, ""), "neutron-server"));
+    }
+
+    #[test]
+    fn injection_is_stale_on_image_change_missing_pythonpath_or_restored_dependency_jobs() {
+        assert!(!K8s::injection_is_current(&deployment("img:2", "img:1", true, ""), "neutron-server"));
+        assert!(!K8s::injection_is_current(&deployment("img:1", "img:1", false, ""), "neutron-server"));
+        assert!(!K8s::injection_is_current(
+            &deployment("img:1", "img:1", true, "neutron-db-sync,neutron-ks-user"),
+            "neutron-server"
+        ));
     }
 }

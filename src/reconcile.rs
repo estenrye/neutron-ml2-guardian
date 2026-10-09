@@ -90,10 +90,12 @@ fn backoff_delay(failures: u32) -> Duration {
 /// -- producing a false "degraded" on every single successful repair, not
 /// just an occasional flake. These bound how long the post-repair check
 /// waits for a genuinely Ready replacement pod before accepting the
-/// (possibly still-failing) result: observed real rollouts settle within
-/// ~25-30s, so 6 attempts at 5s apart gives real repairs room to finish
-/// while still bounding a truly stuck rollout.
-const POST_REPAIR_CHECK_RETRIES: u32 = 6;
+/// (possibly still-failing) result: real rollouts once settled
+/// in ~25-30s, but the injector initContainer now pip-installs ~50 wheels
+/// (and on 2026.8 the pod also waits on PCD's own init), so 60 attempts at
+/// 5s apart (5 min) keeps a normal rollout from being reported as a failed
+/// repair while still bounding a truly stuck one.
+const POST_REPAIR_CHECK_RETRIES: u32 = 60;
 const POST_REPAIR_CHECK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 // Confirmed 2026-09-14 against the live cluster (`kubectl get deployment
